@@ -1,0 +1,59 @@
+# APK Morph Configuration Example
+# Copy this file to config.toml (or ~/.config/apkmorph/config.toml) and edit values.
+# The library will look for this file in the project root, then in XDG config dirs.
+
+[llm]
+# Default Ollama model. Must be pulled locally (ollama pull <model>).
+default_model = "llama3.2"
+temperature = 0.15
+context_length = 12288
+top_p = 0.9
+
+[tools]
+# Full paths to external binaries. Empty = use $PATH.
+apktool = ""
+zipalign = ""
+apksigner = ""
+java_home = ""
+
+[signing]
+# Debug keystore is used when no keystore is supplied.
+use_debug = true
+keystore_path = "~/.android/debug.keystore"
+keystore_password = "android"
+key_alias = "androiddebugkey"
+# For release signing provide your own keystore and set use_debug = false
+
+[paths]
+# Working directories (relative to project root or absolute)
+working_dir = "decompiled"
+build_dir = "builds"
+output_dir = "patched_apks"
+# Persistent state for CLI (plans, history)
+state_dir = "~/.apkmorph"
+
+[ui]
+# Streamlit UI preferences
+port = 8501
+theme_primary = "#2563eb"
+theme_background = "#f1f5f9"
+sidebar_width = 320
+# Whether to show confidence scores and raw Smali diffs by default
+show_diff = true
+show_confidence = true
+
+[analysis]
+# Limits to keep LLM context reasonable
+max_strings = 250
+component_limit = 80
+max_search_results = 30
+
+# Optional: custom system prompt overrides (advanced)
+[prompts]
+patch_system = """
+You are an expert Android reverse-engineering assistant...
+"""
+
+[logging]
+level = "INFO"
+file = "apkmorph.log"

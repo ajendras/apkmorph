@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="572" viewBox="0 0 900 572" role="img" aria-label="APK Morph — demo">
+  <style>
+    text{font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace;font-size:15px}
+    .l{opacity:0}
+    .ty{clip-path:inset(0 100% 0 0)}
+    .cur{animation:blink 1s steps(1) infinite}
+    @keyframes show{to{opacity:1}}
+    @keyframes type{to{clip-path:inset(0 0 0 0)}}
+    @keyframes blink{50%{opacity:0}}
+    @media (prefers-reduced-motion:reduce){.l{opacity:1;animation:none!important}.ty{clip-path:none;animation:none!important}}
+  </style>
+  <rect width="900" height="572" rx="14" fill="#0d1117"/>
+  <rect x=".5" y=".5" width="899" height="572" rx="14" fill="none" stroke="#30363d"/>
+  <rect width="900" height="40" rx="14" fill="#161b22"/><rect y="26" width="900" height="14" fill="#161b22"/>
+  <circle cx="24" cy="20" r="6" fill="#ff5f57"/><circle cx="44" cy="20" r="6" fill="#febc2e"/><circle cx="64" cy="20" r="6" fill="#28c840"/>
+  <text x="450" y="25" text-anchor="middle" fill="#8b949e" style="font-size:13px">APK Morph — demo</text>
+<text x="28" y="74" class="l" style="animation:show .01s 0.60s forwards"><tspan fill="#f1f5f9">❯</tspan></text><text x="50" y="74" class="l ty" style="animation:show .01s 0.60s forwards,type 1.13s steps(25) 0.60s forwards" fill="#e5e7eb">apkmorph analyze game.apk</text>
+<text x="50" y="100" class="l" style="animation:show .01s 2.03s forwards" fill="#94a3b8">Decompiling APK...</text>
+<text x="50" y="126" class="l" style="animation:show .01s 2.25s forwards" fill="#94a3b8">Detected Unity + 2 ad SDKs</text>
+<text x="50" y="152" class="l" style="animation:show .01s 2.47s forwards" fill="#94a3b8">AI summary: endless runner with interstitials at level end</text>
+<text x="50" y="178" class="l" style="animation:show .01s 2.69s forwards" fill="#94a3b8">Report saved to ./analysis.json</text>
+<text x="28" y="230" class="l" style="animation:show .01s 3.26s forwards"><tspan fill="#f1f5f9">❯</tspan></text><text x="50" y="230" class="l ty" style="animation:show .01s 3.26s forwards,type 2.03s steps(45) 3.26s forwards" fill="#e5e7eb">apkmorph patch &quot;remove all ads and analytics&quot;</text>
+<text x="50" y="256" class="l" style="animation:show .01s 5.59s forwards" fill="#94a3b8">Querying local llama3.2...</text>
+<text x="50" y="282" class="l" style="animation:show .01s 5.81s forwards" fill="#94a3b8">Located 14 ad-related methods and 3 trackers</text>
+<text x="50" y="308" class="l" style="animation:show .01s 6.03s forwards" fill="#94a3b8">Patch plan generated with 91% confidence</text>
+<text x="50" y="334" class="l" style="animation:show .01s 6.25s forwards" fill="#94a3b8">Review diffs before applying? (y/N)</text>
+<text x="28" y="386" class="l" style="animation:show .01s 6.82s forwards"><tspan fill="#f1f5f9">❯</tspan></text><text x="50" y="386" class="l ty" style="animation:show .01s 6.82s forwards,type 0.63s steps(14) 6.82s forwards" fill="#e5e7eb">apkmorph apply</text>
+<text x="50" y="412" class="l" style="animation:show .01s 7.75s forwards" fill="#94a3b8">Patching Smali and manifest...</text>
+<text x="50" y="438" class="l" style="animation:show .01s 7.97s forwards" fill="#94a3b8">Rebuilding resources...</text>
+<text x="50" y="464" class="l" style="animation:show .01s 8.19s forwards" fill="#94a3b8">Signing with v1+v2...</text>
+<text x="50" y="490" class="l" style="animation:show .01s 8.41s forwards" fill="#94a3b8">Patched APK written to game-morphed.apk</text>
+<g class="l" style="animation:show .01s 8.98s forwards"><text x="28" y="542" fill="#f1f5f9">❯</text><rect class="cur" x="50" y="527" width="10" height="18" fill="#e5e7eb"/></g>
+</svg>
