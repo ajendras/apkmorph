@@ -5,7 +5,7 @@ and UI components. All models are immutable by default and include
 helpful validation and helper methods.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uuid
@@ -75,7 +75,7 @@ class PatchPlan(BaseModel):
         default="",
         description="Summary of the APK that was analyzed",
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class AnalysisReport(BaseModel):
@@ -110,7 +110,7 @@ class AnalysisReport(BaseModel):
     )
     metadata: Dict[str, Any] = Field(default_factory=dict)
     size_bytes: int = Field(default=0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def summary(self) -> str:
         """Return a compact one-line summary suitable for CLI and UI headers."""
