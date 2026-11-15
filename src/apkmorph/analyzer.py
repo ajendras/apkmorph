@@ -24,13 +24,14 @@ class APKAnalyzer:
     All operations are local and deterministic.
     """
 
-    def __init__(self, working_dir: Path = Path("decompiled")) -> None:
+    def __init__(self, working_dir: str | Path = Path("decompiled")) -> None:
         """Initialize analyzer with a working directory for decompiled artifacts.
 
         Args:
-            working_dir: Base directory for decompiled APKs (default: ./decompiled)
+            working_dir: Base directory for decompiled APKs (default: ./decompiled).
+                         Accepts str or Path.
         """
-        self.working_dir = working_dir
+        self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
     def decompile(self, apk_path: str) -> AnalysisReport:
@@ -123,10 +124,12 @@ class APKAnalyzer:
         return report
 
     def extract_components(self, decompiled_dir: Path) -> List[str]:
-        """Extract fully-qualified class names by walking the smali directory.
+        """Extract fully-qualified class names by walking all smali* directories.
+
+        Supports multidex (smali, smali_classes2, ...).
 
         Args:
-            decompiled_dir: Root of the decompiled APK (must contain smali/)
+            decompiled_dir: Root of the decompiled APK (must contain smali*/)
 
         Returns:
             List of class names (e.g. com.example.MainActivity)
@@ -135,28 +138,21 @@ class APKAnalyzer:
             return []
 
         components: List[str] = []
-        smali_root = decompiled_dir / "smali"
-        if not smali_root.exists():
-            # Some APKs use smali_classesN for multidex
-            for smali_variant in decompiled_dir.glob("smali*"):
-                if smali_variant.is_dir():
-                    self._walk_smali(smali_variant, components)
-            return components
-
-        self._walk_smali(smali_root, components)
+        for smali_variant in decompiled_dir.glob("smali*"):
+            if smali_variant.is_dir():
+                self._walk_smali(smali_variant, components)
         return components
 
     def _walk_smali(self, root: Path, components: List[str]) -> None:
-        """Recursively walk smali tree and convert paths to class names."""
+        """Recursively walk smali tree and convert paths to class names.
+
+        Uses relative_to(root) so smali*/ prefix is automatically omitted.
+        """
         for smali_file in root.rglob("*.smali"):
             try:
-                rel = smali_file.relative_to(root.parent)
-                # smali/com/example/Foo.smali -> com.example.Foo
+                rel = smali_file.relative_to(root)
                 class_name = (
                     str(rel)
-                    .replace("smali/", "")
-                    .replace("smali_classes2/", "")
-                    .replace("smali_classes3/", "")
                     .replace("/", ".")
                     .replace(".smali", "")
                 )

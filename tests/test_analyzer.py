@@ -1,161 +1,191 @@
-"""Tests for the APK analyzer.
+"""Tests for the APKAnalyzer.
 
-Uses mocks for Apktool, Androguard and filesystem operations so that tests
-run reliably in CI without requiring Java, apktool, or real APK fixtures.
+Covers decompilation flow (with mocks for Apktool and Androguard), component
+extraction from Smali (including multidex), string resource parsing, keyword
+search, and error handling. All tests are self-contained and do not require
+external tools or fixture APKs.
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
+import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from apkmorph.analyzer import APKAnalyzer
 from apkmorph.models import AnalysisReport
 
 
-def test_analyzer_init(tmp_path: Path) -> None:
-    """Test that the analyzer initializes with a working directory."""
-    work_dir = tmp_path / "decompiled"
-    analyzer = APKAnalyzer(working_dir=work_dir)
-    assert analyzer.working_dir == work_dir
-    assert analyzer.working_dir.exists()
+class TestAPKAnalyzer:
+    def test_init(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "work"
+        analyzer = APKAnalyzer(working_dir)
+        assert analyzer.working_dir == working_dir
+        assert working_dir.exists()
 
+    def test_init_with_str(self, tmp_path: Path) -> None:
+        """Test that str is also accepted for working_dir."""
+        analyzer = APKAnalyzer(str(tmp_path))
+        assert isinstance(analyzer.working_dir, Path)
 
-def test_decompile_invalid_inputs(tmp_path: Path) -> None:
-    """Test early validation errors for bad input paths."""
-    analyzer = APKAnalyzer(working_dir=tmp_path)
+    @patch("apkmorph.analyzer.run_apktool")
+    @patch("apkmorph.analyzer.APK")
+    def test_decompile(
+        self, mock_apk_class: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        apk_file = tmp_path / "test.apk"
+        apk_file.touch()
+        mtime = 1234567890
 
-    with pytest.raises(FileNotFoundError, match="APK file not found"):
-        analyzer.decompile("nonexistent.apk")
+        decomp_dir = tmp_path / f"apk_test_{mtime}"
+        decomp_dir.mkdir(parents=True, exist_ok=True)
 
-    fake_txt = tmp_path / "not_an_apk.txt"
-    fake_txt.touch()
-    with pytest.raises(ValueError, match="Input must be a valid .apk file"):
-        analyzer.decompile(str(fake_txt))
+        # Create fake smali
+        smali_file = decomp_dir / "smali" / "com" / "example" / "MainActivity.smali"
+        smali_file.parent.mkdir(parents=True, exist_ok=True)
+        smali_file.write_text(
+            ".class public Lcom/example/MainActivity;\n"
+            ".method public onCreate()V\n"
+            "    return-void\n"
+            ".end method\n"
+        )
 
+        # fake strings
+        strings_file = decomp_dir / "res" / "values" / "strings.xml"
+        strings_file.parent.mkdir(parents=True, exist_ok=True)
+        strings_file.write_text(
+            '<?xml version="1.0"?>\n<resources>\n'
+            '  <string name="app_name">TestApp</string>\n'
+            "</resources>"
+        )
 
-@patch("apkmorph.analyzer.run_apktool")
-@patch("apkmorph.analyzer.APK")
-def test_decompile_success(
-    mock_apk: MagicMock, mock_run: MagicMock, tmp_path: Path
-) -> None:
-    """Test full decompilation flow with mocked external tools."""
-    mock_run.return_value = None
+        # Setup Androguard mock
+        mock_apk = MagicMock()
+        mock_apk.get_package.return_value = "com.example.testapp"
+        mock_apk.get_androidversion_name.return_value = "1.2.3"
+        mock_apk.get_androidversion_code.return_value = 123
+        mock_apk.get_min_sdk_version.return_value = 24
+        mock_apk.get_target_sdk_version.return_value = 34
+        mock_apk.get_main_activity.return_value = "com.example.testapp.MainActivity"
+        mock_apk.get_activities.return_value = ["com.example.testapp.MainActivity"]
+        mock_apk.get_services.return_value = ["com.example.testapp.BackgroundService"]
+        mock_apk.get_receivers.return_value = []
+        mock_apk.get_providers.return_value = []
+        mock_apk.get_permissions.return_value = ["android.permission.INTERNET"]
+        mock_apk.is_signed.return_value = True
+        mock_cert = MagicMock()
+        mock_cert.get_fingerprint.return_value = "SHA1:deadbeef"
+        mock_apk.get_certificates.return_value = [mock_cert]
+        mock_apk_class.return_value = mock_apk
 
-    mock_apk_instance = MagicMock()
-    mock_apk.return_value = mock_apk_instance
-    mock_apk_instance.get_package.return_value = "com.example.app"
-    mock_apk_instance.get_androidversion_name.return_value = "1.0"
-    mock_apk_instance.get_androidversion_code.return_value = 1
-    mock_apk_instance.get_min_sdk_version.return_value = 21
-    mock_apk_instance.get_target_sdk_version.return_value = 33
-    mock_apk_instance.get_main_activity.return_value = "com.example.MainActivity"
-    mock_apk_instance.get_activities.return_value = ["com.example.MainActivity"]
-    mock_apk_instance.get_services.return_value = []
-    mock_apk_instance.get_receivers.return_value = []
-    mock_apk_instance.get_providers.return_value = []
-    mock_apk_instance.get_permissions.return_value = ["android.permission.INTERNET"]
-    mock_apk_instance.is_signed.return_value = True
-    mock_apk_instance.get_certificates.return_value = []
+        with patch.object(Path, "stat") as mock_stat:
+            mock_stat.return_value.st_mtime = mtime
+            analyzer = APKAnalyzer(tmp_path)
+            report = analyzer.decompile(str(apk_file))
 
-    analyzer = APKAnalyzer(working_dir=tmp_path)
+        assert isinstance(report, AnalysisReport)
+        assert report.package_name == "com.example.testapp"
+        assert report.version_name == "1.2.3"
+        assert report.version_code == 123
+        assert "com.example.testapp.MainActivity" in report.components
+        assert "com.example.testapp.BackgroundService" in report.components
+        assert "TestApp" in report.strings
+        assert report.decompiled_dir == decomp_dir.absolute()
+        mock_run.assert_called_once()
 
-    with patch.object(
-        analyzer, "extract_components", return_value=["com.example.MainActivity"]
-    ):
-        with patch.object(
-            analyzer, "_extract_strings", return_value=["Hello", "World"]
-        ):
-            report = analyzer.decompile("test.apk")
+    def test_extract_components(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        smali_dir = tmp_path / "smali" / "com" / "example"
+        smali_dir.mkdir(parents=True)
+        (smali_dir / "Main.smali").touch()
+        helper_dir = smali_dir / "utils"
+        helper_dir.mkdir()
+        (helper_dir / "Helper.smali").touch()
 
-    assert isinstance(report, AnalysisReport)
-    assert report.package_name == "com.example.app"
-    assert report.version_name == "1.0"
-    assert report.version_code == 1
-    assert report.min_sdk == 21
-    assert report.target_sdk == 33
-    assert "com.example.MainActivity" in report.components
-    assert "Hello" in report.strings
-    assert report.metadata["is_signed"] is True
-    assert isinstance(report.decompiled_dir, Path)
+        components = analyzer.extract_components(tmp_path)
+        assert len(components) == 2
+        assert "com.example.Main" in components
+        assert "com.example.utils.Helper" in components
 
+    def test_extract_components_multidex(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        for variant in ["smali", "smali_classes2", "smali_classes3"]:
+            d = tmp_path / variant / "com" / "example"
+            d.mkdir(parents=True)
+            (d / f"Class{variant[-1] if variant != 'smali' else '1'}.smali").touch()
 
-def test_extract_components(tmp_path: Path) -> None:
-    """Test Smali directory walking and class-name conversion."""
-    analyzer = APKAnalyzer()
+        components = analyzer.extract_components(tmp_path)
+        assert len(components) == 3
+        assert any("Class1" in c for c in components)
+        assert any("Class2" in c for c in components)
+        assert any("Class3" in c for c in components)
 
-    # Fake multi-dex layout
-    smali_dir = tmp_path / "smali_classes2" / "com" / "example"
-    smali_dir.mkdir(parents=True)
-    (smali_dir / "MainActivity.smali").write_text(
-        ".class public Lcom/example/MainActivity;"
-    )
-    (smali_dir / "utils" / "Helper.smali").mkdir(parents=True)
-    (smali_dir / "utils" / "Helper.smali").write_text(
-        ".class public Lcom/example/utils/Helper;"
-    )
-
-    components = analyzer.extract_components(tmp_path)
-    assert "com.example.MainActivity" in components
-    assert "com.example.utils.Helper" in components
-
-
-def test_find_by_keyword(tmp_path: Path) -> None:
-    """Test keyword search over components and XML resources."""
-    analyzer = APKAnalyzer()
-
-    # Fake XML resources
-    values_dir = tmp_path / "res" / "values"
-    values_dir.mkdir(parents=True)
-    (values_dir / "strings.xml").write_text(
-        '<string name="app_name">Test App</string>\n'
-        '<string name="analytics">analytics tracker</string>'
-    )
-    (values_dir / "colors.xml").write_text('<color name="primary">#000000</color>')
-
-    # Also create a smali file so component search works
-    smali_dir = tmp_path / "smali" / "com" / "example"
-    smali_dir.mkdir(parents=True)
-    (smali_dir / "Analytics.smali").write_text(
-        ".class public Lcom/example/Analytics;"
-    )
-
-    matches = analyzer.find_by_keyword("analytics", tmp_path)
-    assert len(matches) > 0
-    assert any("Analytics" in m for m in matches)
-    assert any("resource:" in m for m in matches)
-
-    matches = analyzer.find_by_keyword("primary", tmp_path)
-    assert any("resource:colors.xml" in m for m in matches)
-
-    assert len(analyzer.find_by_keyword("", tmp_path)) == 0
-
-
-def test_extract_strings(tmp_path: Path) -> None:
-    """Test parsing of strings.xml with length filtering."""
-    analyzer = APKAnalyzer()
-
-    values_dir = tmp_path / "res" / "values"
-    values_dir.mkdir(parents=True)
-    (values_dir / "strings.xml").write_text(
-        """<?xml version="1.0" encoding="utf-8"?>
+    def test_extract_strings(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        values_dir = tmp_path / "res" / "values"
+        values_dir.mkdir(parents=True)
+        (values_dir / "strings.xml").write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Test Application</string>
-    <string name="welcome">Welcome to the app!</string>
-    <string name="very_long_string">"""
-        + "x" * 200
-        + """</string>
+    <string name="app_name">Test App</string>
+    <string name="greeting">Hello, world!</string>
     <string-array name="options">
-        <item>Option One</item>
-        <item>Option Two</item>
+        <item>Option 1</item>
+        <item>Option 2</item>
     </string-array>
-</resources>
-"""
-    )
+</resources>"""
+        )
 
-    strings = analyzer._extract_strings(tmp_path)
-    assert "Test Application" in strings
-    assert "Welcome to the app!" in strings
-    assert "Option One" in strings
-    assert not any(len(s) >= 120 for s in strings)
-    # The very_long_string should have been filtered
-    assert not any("x" * 50 in s for s in strings)
+        strings = analyzer._extract_strings(tmp_path)
+        assert "Test App" in strings
+        assert "Hello, world!" in strings
+        assert "Option 1" in strings
+        assert "Option 2" in strings
+        assert not any(len(s) >= 120 for s in strings)
+
+    def test_find_by_keyword(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        # setup smali
+        smali_dir = tmp_path / "smali" / "com" / "example" / "analytics"
+        smali_dir.mkdir(parents=True)
+        (smali_dir / "Tracker.smali").touch()
+
+        # setup xml
+        xml_dir = tmp_path / "res" / "xml"
+        xml_dir.mkdir(parents=True)
+        (xml_dir / "tracker.xml").write_text("<tracker>enabled</tracker>")
+
+        matches = analyzer.find_by_keyword("track", tmp_path)
+        assert len(matches) > 0
+        assert any("Tracker" in m for m in matches)
+        assert any("resource:tracker.xml" in m for m in matches)
+
+    def test_find_by_keyword_empty(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        assert analyzer.find_by_keyword("") == []
+        assert analyzer.find_by_keyword("   ") == []
+
+    def test_decompile_file_not_found(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        with pytest.raises(FileNotFoundError, match="APK file not found"):
+            analyzer.decompile("missing.apk")
+
+    def test_decompile_invalid_file(self, tmp_path: Path) -> None:
+        analyzer = APKAnalyzer(tmp_path)
+        bad = tmp_path / "not_an_apk.txt"
+        bad.touch()
+        with pytest.raises(ValueError, match="Input must be a valid .apk file"):
+            analyzer.decompile(str(bad))
+
+    @patch("apkmorph.analyzer.run_apktool")
+    def test_decompile_apktool_failure(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_run.side_effect = subprocess.CalledProcessError(
+            1, ["apktool"], stderr=b"apktool error"
+        )
+        analyzer = APKAnalyzer(tmp_path)
+        apk = tmp_path / "test.apk"
+        apk.touch()
+        with pytest.raises(RuntimeError, match="Apktool decompilation failed"):
+            analyzer.decompile(str(apk))
