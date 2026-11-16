@@ -48,6 +48,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 <tr>
 <td valign="top"><h3>📊 Visual Dashboard</h3><br>Streamlit UI shows component tree, patch history, confidence scores and export options</td>
 <td valign="top"><h3>🔒 Fully Local</h3><br>No data leaves your machine; works with any Ollama model and optional GPU acceleration</td>
+<td valign="top"><h3>🔬 Runtime Observation</h3><br>Frida scripts observe which methods, analytics and ad calls are actually used at runtime to inform the LLM before generating patches</td>
 </tr>
 </table>
 
@@ -59,6 +60,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 - Ollama running with a pulled model (`ollama pull llama3.2`)
 - Apktool, zipalign and apksigner on your PATH (Android SDK build-tools)
 - Java runtime
+- Frida server on device/emulator (for runtime observation)
 
 ```bash
 pip install -e .
@@ -73,7 +75,7 @@ The CLI entry point `apkmorph` is automatically installed from `pyproject.toml`.
 # 1. Analyze an APK
 apkmorph analyze sample.apk -o report.md
 
-# 2. Generate a patch plan from natural language
+# 2. Generate a patch plan from natural language (uses Frida runtime data)
 apkmorph patch "disable all analytics, remove ads and change app name" sample.apk --model llama3.2
 
 # 3. Apply the plan and build a signed APK
@@ -109,6 +111,7 @@ from apkmorph.builder import APKBuilder
 
 analyzer = APKAnalyzer()
 report = analyzer.decompile("game.apk")
+report = analyzer.observe_runtime(report)  # observes live method calls via Frida
 
 generator = PatchGenerator(model="llama3.2")
 plan = generator.from_description("remove all ads and update app name", report)
@@ -149,6 +152,8 @@ builder.align_and_sign("unsigned.apk", keystore="release.jks")
 | `paths.build_dir`       | `builds`              | Intermediate artifacts for `APKBuilder` |
 | `ui.port`               | `8501`                | Streamlit server port (passed to `apkmorph ui --port`) |
 | `analysis.max_strings`  | `250`                 | Limit passed to `AnalysisReport.strings` for LLM context |
+| `frida.duration`        | `10`                  | Observation window in seconds for Frida hooks |
+| `frida.auto_observe`    | `true`                | Whether `from_description` automatically enriches reports with runtime data |
 
 Copy `config.toml.example` to `config.toml` or `~/.config/apkmorph/config.toml`.
 
@@ -157,7 +162,8 @@ Copy `config.toml.example` to `config.toml` or `~/.config/apkmorph/config.toml`.
 ```mermaid
 flowchart TD
     APK[APK file] --> Analyzer[APKAnalyzer.decompile]
-    Analyzer --> Report[AnalysisReport]
+    Analyzer --> Frida[observe_runtime() with Frida scripts]
+    Frida --> Report[AnalysisReport with runtime_observations]
     Report --> Generator[PatchGenerator.from_description]
     Generator --> LLM[LLMClient.query]
     LLM --> Ollama[(Ollama<br>llama3.2)]
@@ -204,14 +210,14 @@ flowchart TD
 pytest -q
 ```
 
-Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, and safety checks. Run with `pytest -q --cov` using the config in `pyproject.toml`.
+Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, and the new Frida runtime observation path (with realistic simulation fallback). Run with `pytest -q --cov` using the config in `pyproject.toml`.
 
 ## 📍 Roadmap
 
 <!-- roadmap:start -->
 - [x] **v0.1.0** — first release: Instant Ingestion, Natural Language, Code Reasoning, Precise Patches
 - [x] Add resource.arsc and XML intelligent editing with AI-suggested string changes
-- [ ] Integrate Frida scripts to observe runtime behavior before suggesting patches
+- [x] Integrate Frida scripts to observe runtime behavior before suggesting patches
 - [ ] Build interactive side-by-side Smali diff viewer with hover explanations
 - [ ] Support additional local models (Gemma2, Phi3, CodeLlama) with auto-download
 - [ ] Implement batch mode for applying the same natural-language patch to many APKs

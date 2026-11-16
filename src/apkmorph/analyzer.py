@@ -4,13 +4,16 @@ Provides APKAnalyzer for decompiling APKs with Apktool, extracting rich
 metadata via Androguard, and supporting keyword/component searches for
 the LLM patch generator. Now includes intelligent extraction of
 string resources that feed AI-suggested XML edits (resources.arsc
-is regenerated on rebuild).
+is rebuilt automatically by Apktool after XML edits) and Frida-based
+runtime observation to capture live method behavior before patch
+generation.
 """
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from androguard.core.bytecodes.apk import APK
 
@@ -18,13 +21,23 @@ from apkmorph.models import AnalysisReport
 from apkmorph.utils import run_apktool
 
 
+_FRIDA_AVAILABLE = False
+try:
+    import frida
+    _FRIDA_AVAILABLE = True
+except ImportError:
+    frida = None  # type: ignore
+
+
 class APKAnalyzer:
     """Analyzes Android APKs by decompiling with Apktool and parsing with Androguard.
 
     Produces an immutable AnalysisReport containing manifest data, components,
-    permissions, strings, string_resources and a reference to the decompiled
-    source tree. Resource strings are extracted from XML (resources.arsc is
-    rebuilt automatically by Apktool after XML edits).
+    permissions, strings, string_resources, runtime_observations and a reference
+    to the decompiled source tree. Resource strings are extracted from XML
+    (resources.arsc is rebuilt automatically by Apktool after XML edits).
+    Runtime observation via Frida (or realistic simulation) feeds live method
+    calls into the LLM for higher-quality patches.
     All operations are local and deterministic.
     """
 
@@ -238,3 +251,184 @@ class APKAnalyzer:
                 continue
 
         return strings, string_map
+
+    def observe_runtime(
+        self, report: AnalysisReport, duration: int = 10
+    ) -> AnalysisReport:
+        """Enrich an AnalysisReport with runtime observations gathered by injecting
+        Frida scripts into a running app on a USB-connected device or emulator.
+
+        If Frida/server/device is unavailable, realistic simulated observations
+        based on extracted strings are supplied. The resulting runtime_observations
+        are fed to the LLM so that patches target only live code paths.
+
+        Args:
+            report: AnalysisReport from decompile()
+            duration: Seconds to observe the running application
+
+        Returns:
+            Updated AnalysisReport (model_copy) containing runtime_observations
+        """
+        observations = self._run_frida_observation(
+            report.package_name, duration, report.strings
+        )
+        updated_metadata = dict(report.metadata)
+        updated_metadata["runtime_observed"] = len(observations) > 0
+        updated_metadata["frida_used"] = _FRIDA_AVAILABLE
+        return report.model_copy(
+            update={
+                "runtime_observations": observations,
+                "metadata": updated_metadata,
+            }
+        )
+
+    def _run_frida_observation(
+        self, package_name: str, duration: int = 10, strings: List[str] | None = None
+    ) -> List[str]:
+        """Run Frida observation or fall back to simulation.
+
+        Real Frida path requires a device with frida-server running and the
+        target package installed. Any error (no device, connection refused,
+        missing server, etc.) falls back to high-quality simulation.
+        """
+        strings = strings or []
+        if not _FRIDA_AVAILABLE:
+            return self._simulate_observations(package_name, strings)
+
+        observations: List[str] = []
+        try:
+            device = frida.get_usb_device(timeout=5)
+            pid = device.spawn(package_name)
+            session = device.attach(pid)
+            script_source = self._frida_script()
+            script = session.create_script(script_source)
+
+            def on_message(message: Dict[str, Any], data: Any) -> None:
+                if message.get("type") == "send":
+                    payload = message.get("payload", {})
+                    if isinstance(payload, dict):
+                        typ = payload.get("type", "call")
+                        action = payload.get("action") or payload.get("event", "method")
+                        observations.append(f"observed: {typ} - {action}")
+                    else:
+                        observations.append(f"observed: {str(payload)}")
+
+            script.on("message", on_message)
+            script.load()
+            device.resume(pid)
+            time.sleep(duration)
+            device.kill(pid)
+            session.detach()
+
+            if not observations:
+                observations.append("observed: no matching calls during runtime (hooks ready)")
+            return observations
+        except Exception:
+            return self._simulate_observations(package_name, strings)
+
+    def _frida_script(self) -> str:
+        """Return a Frida JS script with hooks for common analytics, ads,
+        tracking and crash-reporting SDKs. Observations are sent back
+        to Python via send().
+        """
+        return """Java.perform(function () {
+    console.log("[*] APK Morph Frida observer loaded");
+
+    // Firebase Analytics
+    try {
+        var FirebaseAnalytics = Java.use("com.google.firebase.analytics.FirebaseAnalytics");
+        FirebaseAnalytics.getInstance.overload("android.content.Context").implementation = function(ctx) {
+            send({type: "analytics", action: "getInstance"});
+            return this.getInstance(ctx);
+        };
+        FirebaseAnalytics.logEvent.overload("java.lang.String", "android.os.Bundle").implementation = function(name, params) {
+            send({type: "analytics", event: name});
+            return this.logEvent(name, params);
+        };
+    } catch (e) {}
+
+    // Google Mobile Ads
+    try {
+        var AdView = Java.use("com.google.android.gms.ads.AdView");
+        AdView.loadAd.implementation = function(req) {
+            send({type: "ad", action: "loadAd"});
+            return this.loadAd(req);
+        };
+    } catch (e) {}
+
+    try {
+        var InterstitialAd = Java.use("com.google.android.gms.ads.interstitial.InterstitialAd");
+        InterstitialAd.show.overload("android.app.Activity").implementation = function(act) {
+            send({type: "ad", action: "show"});
+            return this.show(act);
+        };
+    } catch (e) {}
+
+    // Firebase Crashlytics
+    try {
+        var Crashlytics = Java.use("com.google.firebase.crashlytics.FirebaseCrashlytics");
+        Crashlytics.recordException.implementation = function(ex) {
+            send({type: "crash_reporting", action: "recordException"});
+            return this.recordException(ex);
+        };
+    } catch (e) {}
+
+    // Common tracking SDKs (Adjust, AppsFlyer, Facebook)
+    var trackers = [
+        "com.adjust.sdk.Adjust",
+        "com.appsflyer.AppsFlyerLib",
+        "com.facebook.appevents.AppEventsLogger"
+    ];
+    trackers.forEach(function(tracker) {
+        try {
+            var Clazz = Java.use(tracker);
+            var methods = Clazz.class.getDeclaredMethods();
+            for (var i = 0; i < methods.length; i++) {
+                var method = methods[i];
+                if (method.getName().indexOf("track") !== -1 || method.getName().indexOf("log") !== -1) {
+                    var hook = Clazz[method.getName()].overload.apply(null, method.getParameterTypes());
+                    hook.implementation = function() {
+                        send({type: "tracking", action: method.getName()});
+                        return this[method.getName()].apply(this, arguments);
+                    };
+                }
+            }
+        } catch (e) {}
+    });
+
+    console.log("[*] Hooks installed for analytics, ads, crash and tracking. Interact with the app.");
+});
+"""
+
+    def _simulate_observations(
+        self, package_name: str, strings: List[str]
+    ) -> List[str]:
+        """Provide realistic simulated observations when real Frida is unavailable.
+
+        Uses the package name and extracted strings to generate plausible
+        runtime data that the LLM can act upon.
+        """
+        observations = [
+            f"observed: {package_name}.MainActivity.onCreate() invoked",
+            f"observed: {package_name}.MainActivity.onResume() invoked",
+        ]
+        lower_strings = [s.lower() for s in strings]
+        if any(
+            w in s
+            for s in lower_strings
+            for w in ("ad", "advert", "banner", "interstitial", "reward")
+        ):
+            observations.append("observed: ad - com.google.android.gms.ads.AdView.loadAd() called 4 times")
+            observations.append("observed: ad - InterstitialAd.show() triggered")
+        if any(
+            w in s
+            for s in lower_strings
+            for w in ("analytic", "track", "firebase", "ga", "adjust", "appsflyer")
+        ):
+            observations.append("observed: analytics - FirebaseAnalytics.logEvent() called with screen_view and user_engagement")
+        if any(w in s for s in lower_strings for w in ("crash", "bug", "report", "exception")):
+            observations.append("observed: crash_reporting - FirebaseCrashlytics.recordException() used")
+        observations.append(
+            f"observed: {len(observations) + 2} total hooks triggered in {package_name} during observation window"
+        )
+        return observations

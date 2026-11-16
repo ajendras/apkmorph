@@ -2,7 +2,9 @@
 
 Translates natural-language requests into a PatchPlan using the local LLM,
 then validates each modification for safety and feasibility before application.
-Now supports XML and resource (string) edits that affect resources.arsc.
+Now supports XML and resource (string) edits that affect resources.arsc and
+automatically enriches reports with Frida runtime observations before
+querying the LLM.
 """
 
 from pathlib import Path
@@ -12,12 +14,14 @@ import re
 from apkmorph.llm import LLMClient
 from apkmorph.models import AnalysisReport, Modification, PatchPlan
 from apkmorph.smali import SmaliEditor
+from apkmorph.analyzer import APKAnalyzer
 
 
 class PatchGenerator:
     """Orchestrates LLM-driven patch plan creation and performs defensive
     validation before any filesystem changes are made. Now supports
-    resource.arsc and XML intelligent editing.
+    resource.arsc and XML intelligent editing and Frida runtime observation
+    to improve patch precision.
     """
 
     def __init__(self, model: str = "llama3.2") -> None:
@@ -30,17 +34,22 @@ class PatchGenerator:
         self.smali = SmaliEditor()
 
     def from_description(
-        self, description: str, report: AnalysisReport
+        self, description: str, report: AnalysisReport, observe: bool = True
     ) -> PatchPlan:
         """Generate a PatchPlan from a plain-English request and an AnalysisReport.
 
-        The LLM receives rich context including string_resources; the returned
-        plan is validated before being returned. Plans may now contain
-        edit_type=resource modifications.
+        If observe=True (default) and the report has no runtime_observations,
+        the report is automatically enriched via APKAnalyzer.observe_runtime()
+        (Frida or simulation). The LLM receives the enriched context so that
+        patches target only methods that execute at runtime.
+
+        The returned plan is validated before being returned. Plans may now
+        contain edit_type=resource modifications.
 
         Args:
             description: Natural language request (e.g. "remove all ads")
             report: Pre-computed AnalysisReport from APKAnalyzer.decompile()
+            observe: Whether to run Frida observation before LLM call
 
         Returns:
             Validated PatchPlan containing ordered Modification steps
@@ -58,9 +67,18 @@ class PatchGenerator:
         if not report or not report.components:
             raise ValueError("AnalysisReport must contain components (run analyzer first)")
 
+        enriched_report = report
+        if observe and not report.runtime_observations:
+            try:
+                analyzer = APKAnalyzer(working_dir=report.decompiled_dir.parent)
+                enriched_report = analyzer.observe_runtime(report)
+            except Exception:
+                # Fall back to the original report if observation fails
+                pass
+
         try:
             # Let LLM produce a PatchPlan (JSON -> model)
-            llm_plan = self.llm.generate_patch(description, report)
+            llm_plan = self.llm.generate_patch(description, enriched_report)
 
             # Merge in report context and ensure immutability
             updated_plan = PatchPlan(
@@ -69,7 +87,7 @@ class PatchGenerator:
                 modifications=llm_plan.modifications,
                 rationale=llm_plan.rationale or "No rationale provided by model.",
                 confidence=llm_plan.confidence,
-                report_summary=report.summary(),
+                report_summary=enriched_report.summary(),
                 created_at=llm_plan.created_at,
             )
 

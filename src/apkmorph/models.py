@@ -2,7 +2,8 @@
 
 Defines the core data structures used across analysis, patch generation,
 and UI components. All models are immutable by default and include
-helpful validation and helper methods.
+helpful validation and helper methods. Extended with runtime_observations
+captured by Frida.
 """
 
 from datetime import datetime, timezone
@@ -89,7 +90,9 @@ class PatchPlan(BaseModel):
 
 
 class AnalysisReport(BaseModel):
-    """Metadata and structural information extracted from an APK."""
+    """Metadata and structural information extracted from an APK.
+    Extended with runtime_observations from Frida to improve patch quality.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
@@ -122,6 +125,10 @@ class AnalysisReport(BaseModel):
         default_factory=dict,
         description="Parsed string resources (key -> value) from values/*.xml",
     )
+    runtime_observations: List[str] = Field(
+        default_factory=list,
+        description="Runtime method calls and behaviors observed using Frida to improve patch accuracy",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
     size_bytes: int = Field(default=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -129,11 +136,13 @@ class AnalysisReport(BaseModel):
     def summary(self) -> str:
         """Return a compact one-line summary suitable for CLI and UI headers."""
         version = self.version_name or "?.?"
+        obs = len(self.runtime_observations)
+        extra = f" • {obs} runtime obs" if obs > 0 else ""
         return (
             f"{self.package_name} v{version} • "
             f"{len(self.components)} components • "
             f"{len(self.permissions)} permissions • "
-            f"{len(self.string_resources)} strings"
+            f"{len(self.string_resources)} strings{extra}"
         )
 
     def find_components(self, keyword: str, limit: int = 10) -> List[str]:
@@ -174,4 +183,11 @@ class AnalysisReport(BaseModel):
         lines.append("## Sample String Resources (first 8)")
         for k, v in list(self.string_resources.items())[:8]:
             lines.append(f"- `{k}` = `{v}`")
+        if self.runtime_observations:
+            lines.append("")
+            lines.append("## Frida Runtime Observations")
+            for obs in self.runtime_observations[:10]:
+                lines.append(f"- {obs}")
+            if len(self.runtime_observations) > 10:
+                lines.append(f"... and {len(self.runtime_observations)-10} more")
         return "\n".join(lines)

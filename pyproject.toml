@@ -17,6 +17,7 @@ dependencies = [
   "androguard>=4.1.0",
   "pydantic>=2.5.0",
   "rich>=13.7.0",
+  "frida>=16.4.0",
 ]
 
 [project.scripts]
