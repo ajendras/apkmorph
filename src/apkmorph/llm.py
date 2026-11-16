@@ -2,6 +2,7 @@
 
 Provides structured prompting for turning natural-language patch requests
 into concrete PatchPlan JSON that can be validated into Pydantic models.
+Now supports XML and resource edits with AI-suggested string changes.
 """
 
 import json
@@ -18,7 +19,9 @@ class LLMClient:
     structured output scaffolding for APK modification tasks.
 
     All communication stays on the local machine. Temperature is kept low
-    for more deterministic engineering-focused responses.
+    for more deterministic engineering-focused responses. Now capable of
+    suggesting XML edits and resource string changes (resources.arsc is
+    rebuilt on next Apktool invocation).
     """
 
     DEFAULT_MODEL = "llama3.2"
@@ -89,7 +92,8 @@ class LLMClient:
 
     def _patch_system_prompt(self) -> str:
         """Expert system prompt that guides the model to produce safe, minimal,
-        auditable APK patches expressed as structured JSON.
+        auditable APK patches expressed as structured JSON. Now includes
+        support for XML and resource string edits.
         """
         return (
             "You are an expert Android reverse-engineering assistant specialized in "
@@ -97,23 +101,27 @@ class LLMClient:
             "Rules:\n"
             "1. ONLY output valid JSON that matches the PatchPlan Pydantic model exactly.\n"
             "2. Prefer small changes: return false from analytics methods, NOP calls, "
-            "remove resource references, or set boolean flags.\n"
+            "remove resource references, set boolean flags, or update string resources.\n"
             "3. Never suggest broad changes that could destabilize the app or remove "
             "core functionality unless explicitly asked.\n"
             "4. Provide a clear English rationale and per-modification confidence (0.0-1.0).\n"
             "5. Use real class names and method signatures discovered in the provided report.\n"
-            "6. Include a short 'diff' field showing the exact Smali lines added or removed.\n"
-            "7. file_path must be a relative path inside the decompiled directory.\n\n"
+            "6. Include a short 'diff' field showing the exact Smali lines or XML/string change.\n"
+            "7. file_path must be a relative path inside the decompiled directory.\n"
+            "8. For resource and string changes use edit_type='resource', supply resource_key "
+            "and new_value. This will intelligently update strings.xml (resources.arsc is "
+            "regenerated on rebuild). Use edit_type='xml' for manifest or layout tweaks.\n\n"
             "Output only the JSON object. No markdown, no explanation outside the JSON."
         )
 
     def _build_patch_prompt(self, description: str, report: AnalysisReport) -> str:
         """Assemble a rich context prompt that includes the full analysis report,
-        key components, and extracted strings.
+        key components, extracted strings and string_resources.
         """
         summary_md = report.to_markdown()
         sample_components = report.find_components("", limit=12)
         sample_strings = report.strings[:25]
+        sample_resource_keys = list(report.string_resources.keys())[:15]
 
         return f"""Request: {description}
 
@@ -125,27 +133,45 @@ Relevant components (first 12):
 Extracted strings that may indicate trackers, ads, or analytics:
 {chr(10).join(f'• {s}' for s in sample_strings) if sample_strings else 'None found.'}
 
+Available resource keys (use these for intelligent string edits):
+{', '.join(sample_resource_keys) if sample_resource_keys else 'None found.'}
+
 Produce a PatchPlan that satisfies the request using the smallest number of targeted edits.
 Focus on:
-- Analytics / crash reporting SDK initialization
-- AdMob / ad view loading calls
-- Unwanted permissions or receivers
+- Analytics / crash reporting SDK initialization (Smali)
+- AdMob / ad view loading calls (Smali or resource removal)
+- Unwanted permissions or receivers (XML)
 - Splash screen or onboarding flows
+- AI-suggested string changes (edit_type=resource) that will update resources.arsc
+
+You may return a mix of Smali, XML and resource modifications.
 
 Return ONLY a JSON object matching this structure (use realistic values from the report):
 {{
   "description": "{description}",
-  "rationale": "Brief explanation of the strategy...",
+  "rationale": "Brief explanation of the strategy including any string changes...",
   "confidence": 0.87,
   "modifications": [
     {{
       "class_name": "com.example.analytics.Tracker",
       "method": "trackEvent(Ljava/lang/String;)V",
+      "edit_type": "smali",
       "diff": "    invoke-static {{p0, p1}}, ... -> return-void\\n    # was tracking call",
       "description": "NOP the tracking call that matches the user request",
       "confidence": 0.92,
       "file_path": "smali/com/example/analytics/Tracker.smali",
       "location_hint": "line 42"
+    }},
+    {{
+      "class_name": "resource",
+      "method": "update_string",
+      "edit_type": "resource",
+      "resource_key": "ad_banner_text",
+      "new_value": "",
+      "diff": "ad_banner_text changed from 'Advertisement' to empty string",
+      "description": "Empty ad-related string resource (updates resources.arsc)",
+      "confidence": 0.88,
+      "file_path": "res/values/strings.xml"
     }}
   ]
 }}

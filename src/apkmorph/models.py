@@ -7,14 +7,14 @@ helpful validation and helper methods.
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class Modification(BaseModel):
-    """A single, auditable modification to be applied to decompiled Smali or XML."""
+    """A single, auditable modification to be applied to decompiled Smali, XML or resources."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -22,18 +22,28 @@ class Modification(BaseModel):
         default_factory=lambda: uuid.uuid4().hex[:12],
         description="Unique identifier for this modification step",
     )
-    class_name: str = Field(..., description="Fully-qualified Java class name")
-    method: str = Field(..., description="Method name or signature being edited")
+    class_name: str = Field(..., description="Fully-qualified Java class name (empty for resources)")
+    method: str = Field(..., description="Method name/signature or resource identifier")
     diff: str = Field(
         ...,
-        description="Human-readable description of the inserted/removed instructions",
+        description="Human-readable description of the inserted/removed instructions or string change",
     )
     description: str = Field(
         default="",
         description="Plain-English explanation of why this change is needed",
     )
+    edit_type: Literal["smali", "xml", "resource"] = Field(
+        default="smali",
+        description="Type of edit: smali, xml or resource (updates resources.arsc on rebuild)",
+    )
     file_path: Optional[Path] = Field(
         default=None, description="Relative path to the Smali/XML file"
+    )
+    resource_key: Optional[str] = Field(
+        default=None, description="String resource key when edit_type is resource"
+    )
+    new_value: Optional[str] = Field(
+        default=None, description="New value for the string resource"
     )
     confidence: float = Field(
         default=0.85,
@@ -108,6 +118,10 @@ class AnalysisReport(BaseModel):
         default_factory=list,
         description="Extracted string constants useful for keyword search",
     )
+    string_resources: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Parsed string resources (key -> value) from values/*.xml",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
     size_bytes: int = Field(default=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -118,7 +132,8 @@ class AnalysisReport(BaseModel):
         return (
             f"{self.package_name} v{version} • "
             f"{len(self.components)} components • "
-            f"{len(self.permissions)} permissions"
+            f"{len(self.permissions)} permissions • "
+            f"{len(self.string_resources)} strings"
         )
 
     def find_components(self, keyword: str, limit: int = 10) -> List[str]:
@@ -143,6 +158,7 @@ class AnalysisReport(BaseModel):
             f"**APK:** {self.apk_path}",
             f"**Version:** {self.version_name or 'unknown'} (code {self.version_code})",
             f"**SDK:** min {self.min_sdk} / target {self.target_sdk}",
+            f"**Strings:** {len(self.string_resources)} resources extracted",
             "",
             "## Permissions",
         ]
@@ -154,4 +170,8 @@ class AnalysisReport(BaseModel):
             lines.append(f"- `{comp}`")
         if len(self.components) > 20:
             lines.append(f"... and {len(self.components)-20} more")
+        lines.append("")
+        lines.append("## Sample String Resources (first 8)")
+        for k, v in list(self.string_resources.items())[:8]:
+            lines.append(f"- `{k}` = `{v}`")
         return "\n".join(lines)

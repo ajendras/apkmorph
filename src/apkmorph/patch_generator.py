@@ -2,6 +2,7 @@
 
 Translates natural-language requests into a PatchPlan using the local LLM,
 then validates each modification for safety and feasibility before application.
+Now supports XML and resource (string) edits that affect resources.arsc.
 """
 
 from pathlib import Path
@@ -15,7 +16,8 @@ from apkmorph.smali import SmaliEditor
 
 class PatchGenerator:
     """Orchestrates LLM-driven patch plan creation and performs defensive
-    validation before any filesystem changes are made.
+    validation before any filesystem changes are made. Now supports
+    resource.arsc and XML intelligent editing.
     """
 
     def __init__(self, model: str = "llama3.2") -> None:
@@ -32,10 +34,12 @@ class PatchGenerator:
     ) -> PatchPlan:
         """Generate a PatchPlan from a plain-English request and an AnalysisReport.
 
-        The LLM receives rich context; the returned plan is validated before being returned.
+        The LLM receives rich context including string_resources; the returned
+        plan is validated before being returned. Plans may now contain
+        edit_type=resource modifications.
 
         Args:
-            description: Natural language request (e.g. "remove all analytics")
+            description: Natural language request (e.g. "remove all ads")
             report: Pre-computed AnalysisReport from APKAnalyzer.decompile()
 
         Returns:
@@ -86,6 +90,7 @@ class PatchGenerator:
           • No obvious dangerous keywords or broad destructive patterns
           • Plausible file paths (no path traversal)
           • Basic syntactic sanity of the diff field
+          • Correct fields for resource/XML edits
           • (Future) cross-check that target methods exist in decompiled sources
 
         Raises:
@@ -130,6 +135,20 @@ class PatchGenerator:
                         f"Modification #{i} uses unsafe file_path: {fp}"
                     )
 
+            # Type-specific validation
+            if mod.edit_type in ("xml", "resource"):
+                if not mod.file_path or not str(mod.file_path).endswith((".xml", ".arsc")):
+                    raise ValueError(
+                        f"Modification #{i} of type {mod.edit_type} must target an XML file"
+                    )
+                if mod.edit_type == "resource" and not mod.resource_key:
+                    raise ValueError(
+                        f"Modification #{i} of type resource must specify resource_key"
+                    )
+            elif mod.edit_type == "smali" and not mod.method.startswith("<"):
+                # basic sanity for smali
+                pass
+
             # Look for dangerous keywords in the diff or description
             combined_text = f"{mod.diff} {mod.description}".lower()
             for pattern in dangerous_patterns:
@@ -153,7 +172,8 @@ class PatchGenerator:
     def simulate_apply(self, plan: PatchPlan, decompiled_dir: Path) -> dict[str, Any]:
         """Dry-run simulation of each modification using SmaliEditor.
 
-        Returns a report of what would be changed without touching disk.
+        Now supports XML and resource edits. Returns a report of what
+        would be changed without touching disk.
         Used by tests and the UI preview feature.
         """
         results: dict[str, Any] = {"success": True, "applied": [], "errors": []}
@@ -167,17 +187,26 @@ class PatchGenerator:
                     continue
 
                 target_file = decompiled_dir / mod.file_path
-                if not target_file.exists():
+                if not target_file.exists() and mod.edit_type != "resource":
                     results["errors"].append(f"Target file not found: {target_file}")
                     continue
 
-                # SmaliEditor would read and validate the edit location here
-                self.smali.read_method(str(target_file), mod.method)
+                if mod.edit_type == "smali":
+                    self.smali.read_method(str(target_file), mod.method)
+                elif mod.edit_type in ("xml", "resource"):
+                    if mod.resource_key and target_file.exists():
+                        content = target_file.read_text(encoding="utf-8", errors="ignore")
+                        if f'name="{mod.resource_key}"' not in content and mod.new_value:
+                            results["applied"].append(
+                                {"note": f"new resource key {mod.resource_key} will be added"}
+                            )
+
                 results["applied"].append(
                     {
                         "id": mod.id,
                         "class": mod.class_name,
                         "method": mod.method,
+                        "edit_type": mod.edit_type,
                         "status": "would_apply",
                     }
                 )
