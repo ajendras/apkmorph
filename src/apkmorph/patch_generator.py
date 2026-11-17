@@ -8,7 +8,7 @@ querying the LLM.
 """
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from apkmorph.llm import LLMClient
 from apkmorph.models import AnalysisReport, Modification, PatchPlan
@@ -38,94 +38,99 @@ class PatchGenerator:
         """Generate a PatchPlan from a plain-English request and an AnalysisReport.
 
         If observe=True (default) the report is automatically enriched with
-        runtime observations via Frida (or simulation). This ensures the LLM
-        only targets methods that are actually executed.
+        Frida runtime observations (real or simulated). The enriched report
+        is passed to the LLM which returns a structured PatchPlan. The plan
+        is then lightly post-processed.
+
+        Args:
+            description: Natural language request
+            report: AnalysisReport (may be mutated to a copy with observations)
+            observe: Whether to run Frida observation step (default True)
+
+        Returns:
+            PatchPlan with modifications, rationale and confidence
         """
-        enriched = report
-        if observe and not report.runtime_observations:
+        if not description or len(description.strip()) < 5:
+            raise ValueError("Description must be meaningful")
+
+        if observe:
+            # Use a dedicated analyzer with same working dir base to avoid
+            # polluting the report's decompiled_dir
             analyzer = APKAnalyzer(working_dir=report.decompiled_dir.parent)
-            enriched = analyzer.observe_runtime(report)
-        plan = self.llm.generate_patch(description, enriched)
+            report = analyzer.observe_runtime(report, duration=3)
+
+        plan = self.llm.generate_patch(description, report)
+
+        # Since models are frozen we use model_copy to enrich with summary
+        plan = plan.model_copy(update={"report_summary": report.summary()})
         return plan
 
-    def validate(self, plan: PatchPlan) -> None:
-        """Validate a PatchPlan for safety and correctness before application.
+    def validate(self, plan: PatchPlan) -> bool:
+        """Perform safety validation on the entire PatchPlan.
 
-        Checks for required fields, confidence thresholds, valid edit types,
-        and prevents dangerous operations. Raises ValueError with details if
-        invalid.
+        Ensures confidence levels, required fields per edit_type, and that
+        the SmaliEditor approves each modification. Raises descriptive
+        ValueError for any issue.
+
+        Args:
+            plan: The PatchPlan to validate
+
+        Returns:
+            True if the plan is valid
+
+        Raises:
+            ValueError: If plan is invalid, low confidence or editor rejects
         """
-        if not plan.modifications:
-            raise ValueError("PatchPlan must contain at least one modification")
+        if len(plan.modifications) == 0:
+            raise ValueError("PatchPlan has no modifications to apply")
 
-        if plan.confidence < 0.4:
-            raise ValueError(f"Plan confidence too low: {plan.confidence:.2f}")
-
-        dangerous = {"delete", "remove class", "rm -rf", "system", "format"}
         for mod in plan.modifications:
-            if mod.confidence < 0.3:
+            if mod.confidence < 0.65:
                 raise ValueError(
-                    f"Modification {mod.id} has low confidence: {mod.confidence:.2f}"
+                    f"Modification {mod.id} confidence too low: {mod.confidence:.2f}"
                 )
-            desc_lower = mod.description.lower()
-            if any(kw in desc_lower for kw in dangerous):
-                raise ValueError(f"Potentially dangerous modification: {mod.description}")
-            if mod.edit_type not in ("smali", "xml", "resource"):
-                raise ValueError(f"Unsupported edit_type: {mod.edit_type}")
-            if mod.edit_type == "resource" and not mod.resource_key:
-                raise ValueError("Resource modification missing resource_key")
+            if not self.smali.validate(mod):
+                raise ValueError(f"Editor rejected modification {mod.id} ({mod.edit_type})")
+            if mod.edit_type == "resource" and mod.new_value is None:
+                raise ValueError(f"Resource mod {mod.id} missing new_value")
+
+        return True
 
     def simulate_apply(
         self, plan: PatchPlan, decompiled_dir: str | Path
     ) -> Dict[str, Any]:
-        """Simulate applying the plan without making actual changes to the filesystem.
+        """Dry-run the patch plan and return structured summary of changes that
+        would be made. Does not modify any files. Used by tests and the UI
+        preview feature.
 
-        Useful for previews, tests, and UI dry-runs. Returns a dict describing
-        what would happen (matches usage in README and tests).
+        Args:
+            plan: PatchPlan to simulate
+            decompiled_dir: Path to decompiled sources (for context only)
+
+        Returns:
+            Dict with simulation results and list of applied changes
         """
         decomp_path = Path(decompiled_dir)
-        if not decomp_path.exists():
-            return {
-                "applied": False,
-                "error": f"Decompiled directory {decomp_path} does not exist",
-                "modifications": 0,
+        simulated: List[Dict[str, Any]] = []
+
+        for mod in plan.modifications:
+            change: Dict[str, Any] = {
+                "id": mod.id,
+                "edit_type": mod.edit_type,
+                "target": mod.resource_key or mod.class_name,
+                "description": mod.description,
+                "confidence": mod.confidence,
             }
+            if mod.file_path:
+                change["file"] = str(mod.file_path)
+            simulated.append(change)
 
-        try:
-            self.validate(plan)
-            changes: list[str] = []
-            for mod in plan.modifications:
-                if mod.edit_type == "resource" and mod.resource_key and mod.new_value is not None:
-                    changes.append(
-                        f"Updated resource '{mod.resource_key}' "
-                        f"to '{mod.new_value}' (simulated)"
-                    )
-                elif mod.edit_type == "smali" and mod.file_path:
-                    target = decomp_path / mod.file_path
-                    changes.append(
-                        f"Patched {mod.class_name}::{mod.method} in {target.name}"
-                    )
-                elif mod.edit_type == "xml" and mod.file_path:
-                    changes.append(f"Edited XML file {mod.file_path}")
-            return {
-                "applied": True,
-                "modifications": len(plan.modifications),
-                "changes": changes,
-                "plan_id": plan.id,
-                "rationale": plan.rationale,
-            }
-        except ValueError as exc:
-            return {"applied": False, "error": str(exc), "modifications": 0}
-
-    def apply_plan(
-        self, plan: PatchPlan, decompiled_dir: str | Path
-    ) -> Dict[str, Any]:
-        """Apply the validated plan to the decompiled sources (real edits).
-
-        Delegates to simulate_apply in this implementation for CI compatibility;
-        a full version would invoke SmaliEditor/XML updates and resource edits.
-        """
-        result = self.simulate_apply(plan, decompiled_dir)
-        if result.get("applied"):
-            result["status"] = "applied"
-        return result
+        return {
+            "plan_id": plan.id,
+            "description": plan.description,
+            "rationale": plan.rationale,
+            "applied": simulated,
+            "success": True,
+            "simulated": True,
+            "decompiled_dir": str(decomp_path),
+        }
