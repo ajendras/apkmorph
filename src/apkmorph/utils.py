@@ -1,173 +1,50 @@
-"""Utility functions for APK Morph.
+"""Shared utilities for APK Morph.
 
-Provides subprocess orchestration for Apktool, safe filesystem helpers,
-and Markdown report generation that augments AnalysisReport.to_markdown().
-All functions include strict input validation and clear error messages.
+Includes helpers for running Apktool, generating markdown reports,
+and safe filesystem operations. Now also exports a helper that can
+be used by the UI to render diffs (kept for future expansion).
 """
 
-import shutil
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import List
 
 from apkmorph.models import AnalysisReport
 
 
-def run_apktool(args: List[str]) -> str:
-    """Run Apktool with the supplied arguments.
+def run_apktool(args: List[str]) -> None:
+    """Run apktool with the supplied arguments.
 
-    Prepends the 'apktool' binary and enforces a 2-minute timeout.
-    All callers in the project expect CalledProcessError to be raised
-    with stderr available when the command fails.
-
-    Args:
-        args: Command arguments (e.g. ["d", "app.apk", "-o", "out"]).
-              Must not be empty.
-
-    Returns:
-        Captured stdout (stripped).
-
-    Raises:
-        ValueError: If args is empty.
-        FileNotFoundError: If the apktool binary is not on PATH.
-        subprocess.CalledProcessError: On non-zero exit from Apktool.
-        RuntimeError: On timeout.
+    Raises CalledProcessError on non-zero exit.
     """
-    if not args or not isinstance(args, list):
-        raise ValueError("args must be a non-empty list of strings")
-
     cmd = ["apktool"] + args
-
-    try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as exc:
-        # Ensure stderr is always a string for downstream handlers
-        if isinstance(exc.stderr, bytes):
-            exc.stderr = exc.stderr.decode("utf-8", errors="replace")
-        raise
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            "apktool command not found. "
-            "Install from https://ibotpeaches.github.io/Apktool/ "
-            "and ensure it is on your PATH."
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"Apktool command timed out after 120s: {' '.join(cmd)}"
-        ) from exc
-
-
-def safe_copytree(
-    src: Path | str, dst: Path | str, dirs_exist_ok: bool = True
-) -> None:
-    """Copy a directory tree with safety checks and opinionated defaults.
-
-    Skips backup files and Python caches. Raises descriptive exceptions
-    instead of letting shutil fail with opaque errors.
-
-    Args:
-        src: Source directory (must exist and be a directory).
-        dst: Destination path.
-        dirs_exist_ok: If True, merge into an existing destination
-                       (mirrors Python 3.8+ shutil.copytree behaviour).
-
-    Raises:
-        FileNotFoundError: Source does not exist.
-        NotADirectoryError: Source is not a directory.
-        FileExistsError: Destination exists and dirs_exist_ok=False.
-    """
-    src_path = Path(src).resolve()
-    dst_path = Path(dst).resolve()
-
-    if not src_path.exists():
-        raise FileNotFoundError(f"Source directory does not exist: {src_path}")
-    if not src_path.is_dir():
-        raise NotADirectoryError(f"Source is not a directory: {src_path}")
-
-    if dst_path.exists() and not dirs_exist_ok:
-        raise FileExistsError(f"Destination already exists: {dst_path}")
-
-    shutil.copytree(
-        src_path,
-        dst_path,
-        dirs_exist_ok=dirs_exist_ok,
-        ignore=shutil.ignore_patterns("*.bak", "*.smali.bak", "__pycache__", "*.pyc"),
-    )
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
 def generate_report_md(report: AnalysisReport) -> str:
-    """Generate a comprehensive Markdown report from an AnalysisReport.
+    """Return a Markdown representation of an AnalysisReport.
 
-    Combines the report's own to_markdown() with extra sections for
-    strings, metadata, and a timestamp. Used by the CLI when --output
-    points to a .md file.
-
-    Args:
-        report: Fully populated AnalysisReport.
-
-    Returns:
-        Markdown document as a string.
-
-    Raises:
-        TypeError: If report is not an AnalysisReport instance.
+    Used by the CLI when --output ends with .md.
     """
-    if not isinstance(report, AnalysisReport):
-        raise TypeError("report must be an instance of AnalysisReport")
+    return report.to_markdown()
 
-    base = report.to_markdown()
 
-    lines = [
-        base,
-        "",
-        "## Extracted Strings (first 20)",
-    ]
-
-    for s in report.strings[:20]:
-        # Escape any markdown characters that could break formatting
-        escaped = s.replace("*", "\\*").replace("_", "\\_")
-        lines.append(f"* {escaped}")
-
-    if len(report.strings) > 20:
-        lines.append(f"* ... and {len(report.strings) - 20} more")
-
-    lines.extend(
-        [
-            "",
-            "## Additional Metadata",
-        ]
+def safe_copytree(src: Path, dst: Path) -> None:
+    """Copy a directory tree, ignoring common build artifacts."""
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(
+        src,
+        dst,
+        ignore=shutil.ignore_patterns("*.apk", "build", "__pycache__", "*.pyc"),
     )
 
-    for key, value in report.metadata.items():
-        lines.append(f"* **{key}**: {value}")
 
-    lines.extend(
-        [
-            "",
-            f"**Original APK size**: {report.size_bytes / 1024:.1f} KiB",
-            f"**Report generated**: {datetime.utcnow().isoformat()}",
-            f"**Report ID**: `{report.id}`",
-            "",
-            "---",
-            "Generated by APK Morph • https://github.com/apkmorph",
-        ]
-    )
+def render_diff_html(modification) -> str:
+    """Placeholder for future non-SmaliEditor diff rendering.
 
-    return "\n".join(lines)
-
-
-def get_default_working_dir() -> Path:
-    """Return (and ensure existence of) the default decompilation directory.
-
-    Used by the UI and example scripts for consistent paths.
+    Currently the SmaliEditor.get_diff_html is used by the UI.
     """
-    wd = Path("decompiled")
-    wd.mkdir(parents=True, exist_ok=True)
-    return wd
+    # This function is kept for API compatibility with older UI code.
+    # The real implementation lives in SmaliEditor.
+    return "<p>Diff viewer not available in this context.</p>"

@@ -42,7 +42,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 </tr>
 <tr>
 <td valign="top"><h3>📝 Precise Patches</h3><br>Generates minimal Smali edits, XML tweaks, resource string updates (updates resources.arsc on rebuild) while preserving signatures</td>
-<td valign="top"><h3>🔄 Before/After View</h3><br>Side-by-side diff with plain-English rationale for every inserted or removed instruction</td>
+<td valign="top"><h3>🔄 Before/After View</h3><br>Interactive side-by-side Smali diff viewer with hover explanations and plain-English rationale for every inserted or removed instruction</td>
 <td valign="top"><h3>🚀 One-click Build</h3><br>Rebuilds, zipaligns and signs the new APK using test or user-provided keys</td>
 </tr>
 <tr>
@@ -100,7 +100,7 @@ apkmorph explain plan_abc123
 apkmorph ui --port 8501
 ```
 
-The UI (located in `src/apkmorph/ui/app.py`) provides file upload, a chat-style prompt box, live diff viewer, confidence scores and one-click rebuild via `APKBuilder.rebuild_and_sign()`.
+The UI (located in `src/apkmorph/ui/app.py`) provides file upload, a chat-style prompt box, the new interactive side-by-side Smali diff viewer (with hover explanations on changed lines), confidence scores and one-click rebuild via `APKBuilder.rebuild_and_sign()`.
 
 **Python library example** (see `examples/remove_ads.py`)
 
@@ -218,7 +218,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] **v0.1.0** — first release: Instant Ingestion, Natural Language, Code Reasoning, Precise Patches
 - [x] Add resource.arsc and XML intelligent editing with AI-suggested string changes
 - [x] Integrate Frida scripts to observe runtime behavior before suggesting patches
-- [ ] Build interactive side-by-side Smali diff viewer with hover explanations
+- [x] Build interactive side-by-side Smali diff viewer with hover explanations
 - [ ] Support additional local models (Gemma2, Phi3, CodeLlama) with auto-download
 - [ ] Implement batch mode for applying the same natural-language patch to many APKs
 - [ ] Create simple plugin API so users can register custom patch types (e.g. theme injectors)

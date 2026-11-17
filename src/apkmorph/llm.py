@@ -114,7 +114,9 @@ class LLMClient:
             "and new_value. This will intelligently update strings.xml (resources.arsc is "
             "regenerated on rebuild). Use edit_type='xml' for manifest or layout tweaks.\n"
             "9. Prioritize modifications to methods and classes that appear in the "
-            "runtime_observations. This ensures patches address actual executed code.\n\n"
+            "runtime_observations. This ensures patches address actual executed code.\n"
+            "10. Populate original_snippet, patched_snippet and hover_explanation for the "
+            "interactive side-by-side viewer.\n\n"
             "Output only the JSON object. No markdown, no explanation outside the JSON."
         )
 
@@ -174,7 +176,10 @@ Return ONLY a JSON object matching this structure (use realistic values from the
       "description": "NOP the ad loading call observed at runtime via Frida",
       "confidence": 0.92,
       "file_path": "smali/com/google/android/gms/ads/AdView.smali",
-      "location_hint": "line 42"
+      "location_hint": "line 42",
+      "original_snippet": "    invoke-virtual {{p0, p1}}, Lcom/google/android/gms/ads/AdView;->loadAd(Lcom/google/android/gms/ads/AdRequest;)V\\n    return-void",
+      "patched_snippet": "    # APK Morph disabled ad load\\n    return-void",
+      "hover_explanation": "Early return prevents ad network request (observed via Frida)"
     }},
     {{
       "class_name": "resource",
@@ -185,7 +190,10 @@ Return ONLY a JSON object matching this structure (use realistic values from the
       "diff": "ad_banner_text changed from 'Advertisement' to empty string",
       "description": "Empty ad-related string resource (updates resources.arsc)",
       "confidence": 0.88,
-      "file_path": "res/values/strings.xml"
+      "file_path": "res/values/strings.xml",
+      "original_snippet": "<string name=\\"ad_banner_text\\">Advertisement</string>",
+      "patched_snippet": "<string name=\\"ad_banner_text\\"></string>",
+      "hover_explanation": "Removes visible ad text from UI resources"
     }}
   ]
 }}

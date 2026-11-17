@@ -56,6 +56,18 @@ class Modification(BaseModel):
         default=None,
         description="Approximate line number or anchor comment in the original file",
     )
+    original_snippet: Optional[str] = Field(
+        default=None,
+        description="Original Smali/XML snippet shown in the interactive diff viewer",
+    )
+    patched_snippet: Optional[str] = Field(
+        default=None,
+        description="Patched Smali/XML snippet shown in the interactive diff viewer",
+    )
+    hover_explanation: Optional[str] = Field(
+        default=None,
+        description="Explanation displayed on hover in the side-by-side diff viewer",
+    )
 
 
 class PatchPlan(BaseModel):
