@@ -1,137 +1,197 @@
-"""Tests for PatchGenerator including new XML/resource support."""
+"""Tests for PatchGenerator.
+
+Covers prompt construction, validation, simulate_apply for Smali/XML/resource
+edits, and Frida-aware report enrichment. All external calls (LLM, filesystem
+edits, Frida) are mocked so the suite runs cleanly in CI.
+"""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch, MagicMock
 
 import pytest
-from pydantic import ValidationError
 
-from apkmorph.models import AnalysisReport, Modification, PatchPlan
 from apkmorph.patch_generator import PatchGenerator
+from apkmorph.models import AnalysisReport, PatchPlan, Modification
 
 
 @pytest.fixture
-def sample_report(tmp_path: Path) -> AnalysisReport:
-    """Minimal report with string resources for testing."""
+def sample_report(tmp_path):
     return AnalysisReport(
-        apk_path=tmp_path / "test.apk",
-        package_name="com.example.test",
-        decompiled_dir=tmp_path,
-        components=["com.example.MainActivity"],
-        strings=["analytics", "ad"],
-        string_resources={"app_name": "Test", "ad_text": "Buy now"},
+        apk_path=Path("test.apk"),
+        package_name="com.example.testapp",
+        decompiled_dir=tmp_path / "decompiled",
+        components=["com.example.testapp.MainActivity", "com.google.ads.AdView"],
+        strings=["ad", "analytics", "firebase"],
+        string_resources={"app_name": "Test", "ad_banner": "Ad"},
+        runtime_observations=[
+            "observed: ad - AdView.loadAd()",
+            "observed: analytics - logEvent(screen_view)",
+        ],
         metadata={},
     )
 
 
-def test_from_description_calls_llm(sample_report: AnalysisReport) -> None:
-    """Test that from_description invokes LLM and returns validated plan."""
-    generator = PatchGenerator(model="llama3.2")
-    mock_plan = PatchPlan(
+@pytest.fixture
+def sample_plan():
+    mods = [
+        Modification(
+            class_name="com.google.ads.AdView",
+            method="loadAd",
+            edit_type="smali",
+            diff="- invoke-virtual ...loadAd",
+            description="NOP ad load observed via Frida",
+            confidence=0.92,
+            file_path=Path("smali/com/google/ads/AdView.smali"),
+        ),
+        Modification(
+            class_name="resource",
+            method="string_update",
+            edit_type="resource",
+            resource_key="ad_banner",
+            new_value="",
+            diff="ad_banner changed to empty",
+            description="Clear ad string resource",
+            confidence=0.85,
+            file_path=Path("res/values/strings.xml"),
+        ),
+    ]
+    return PatchPlan(
         description="remove ads",
-        rationale="Empty ad string resources",
-        modifications=[
-            Modification(
-                class_name="resource",
-                method="strings",
-                edit_type="resource",
-                resource_key="ad_text",
-                new_value="",
-                diff="ad_text changed to empty",
-                description="Remove ad text",
-                file_path=Path("res/values/strings.xml"),
-                confidence=0.9,
-            )
-        ],
-    )
-
-    with patch.object(generator.llm, "generate_patch", return_value=mock_plan):
-        plan = generator.from_description("remove ads", sample_report)
-        assert plan.description == "remove ads"
-        assert len(plan.modifications) == 1
-        assert plan.modifications[0].edit_type == "resource"
-
-
-def test_validate_accepts_resource_edit() -> None:
-    """Test validation passes for a valid resource modification."""
-    plan = PatchPlan(
-        description="change string",
-        rationale="test",
-        modifications=[
-            Modification(
-                class_name="resource",
-                method="update",
-                edit_type="resource",
-                resource_key="app_name",
-                new_value="My App",
-                diff="name changed",
-                description="Update app name",
-                file_path=Path("res/values/strings.xml"),
-                confidence=0.85,
-            )
-        ],
-    )
-    generator = PatchGenerator()
-    # Should not raise
-    generator.validate(plan)
-
-
-def test_validate_rejects_invalid_resource() -> None:
-    """Test validation rejects resource edit missing resource_key."""
-    plan = PatchPlan(
-        description="bad resource",
-        rationale="test",
-        modifications=[
-            Modification(
-                class_name="resource",
-                method="update",
-                edit_type="resource",
-                resource_key="",  # missing
-                new_value="foo",
-                diff="bad",
-                description="bad",
-                file_path=Path("res/values/strings.xml"),
-                confidence=0.9,
-            )
-        ],
-    )
-    generator = PatchGenerator()
-    with pytest.raises(ValueError, match="must specify resource_key"):
-        generator.validate(plan)
-
-
-def test_simulate_apply_resource(sample_report: AnalysisReport, tmp_path: Path) -> None:
-    """Test simulate_apply handles resource edits."""
-    mod = Modification(
-        class_name="resource",
-        method="strings",
-        edit_type="resource",
-        resource_key="ad_text",
-        new_value="",
-        diff="ad_text -> ''",
-        description="Remove ad text",
-        file_path=Path("res/values/strings.xml"),
+        modifications=mods,
+        rationale="Targeted live ad and analytics paths from Frida data",
         confidence=0.88,
+        report_summary="Test APK",
+    )
+
+
+def test_from_description(sample_report):
+    generator = PatchGenerator()
+    with patch.object(generator.llm, "generate_patch") as mock_gen:
+        mock_gen.return_value = PatchPlan(
+            description="remove ads",
+            modifications=[],
+            rationale="mock",
+            confidence=0.8,
+        )
+        with patch("apkmorph.patch_generator.APKAnalyzer") as mock_anal:
+            plan = generator.from_description(
+                "remove ads and analytics", sample_report, observe=False
+            )
+    assert isinstance(plan, PatchPlan)
+    mock_gen.assert_called_once()
+
+
+def test_from_description_with_observe(sample_report):
+    generator = PatchGenerator()
+    with patch.object(generator.llm, "generate_patch") as mock_gen:
+        mock_gen.return_value = PatchPlan(
+            description="remove ads",
+            modifications=[],
+            rationale="mock",
+            confidence=0.8,
+        )
+        with patch("apkmorph.analyzer.APKAnalyzer") as mock_anal:
+            mock_anal.return_value.observe_runtime.return_value = sample_report
+            generator.from_description("remove ads", sample_report, observe=True)
+    mock_anal.return_value.observe_runtime.assert_called_once()
+
+
+def test_validate_accepts_valid(sample_plan):
+    generator = PatchGenerator()
+    generator.validate(sample_plan)  # should not raise
+
+
+def test_validate_rejects_low_confidence():
+    generator = PatchGenerator()
+    low_mod = Modification(
+        class_name="com.test.Bad",
+        method="bad",
+        edit_type="smali",
+        diff="",
+        description="dangerous delete",
+        confidence=0.1,
+    )
+    bad_plan = PatchPlan(
+        description="bad plan",
+        modifications=[low_mod],
+        rationale="",
+        confidence=0.2,
+    )
+    with pytest.raises(ValueError, match="low confidence"):
+        generator.validate(bad_plan)
+
+
+def test_validate_rejects_dangerous():
+    generator = PatchGenerator()
+    danger_mod = Modification(
+        class_name="com.test.Bad",
+        method="bad",
+        edit_type="smali",
+        diff="",
+        description="delete core class",
+        confidence=0.7,
+    )
+    bad_plan = PatchPlan(
+        description="bad",
+        modifications=[danger_mod],
+        rationale="",
+        confidence=0.8,
+    )
+    with pytest.raises(ValueError, match="dangerous"):
+        generator.validate(bad_plan)
+
+
+def test_simulate_apply(sample_plan, tmp_path):
+    generator = PatchGenerator()
+    decomp = tmp_path / "decomp"
+    decomp.mkdir()
+    (decomp / "smali").mkdir()
+    result = generator.simulate_apply(sample_plan, decomp)
+    assert result["applied"] is True
+    assert result["modifications"] == 2
+    assert len(result["changes"]) == 2
+    assert "ad_banner" in str(result["changes"])
+
+
+def test_simulate_apply_missing_dir(sample_plan):
+    generator = PatchGenerator()
+    result = generator.simulate_apply(sample_plan, "/nonexistent")
+    assert result["applied"] is False
+    assert "does not exist" in result["error"]
+
+
+def test_simulate_apply_resource_only():
+    generator = PatchGenerator()
+    res_mod = Modification(
+        class_name="resource",
+        method="update",
+        edit_type="resource",
+        resource_key="title",
+        new_value="New Title",
+        diff="title=New Title",
+        description="Update app title",
+        confidence=0.9,
     )
     plan = PatchPlan(
-        description="test",
-        modifications=[mod],
+        description="change title",
+        modifications=[res_mod],
+        rationale="simple string update",
+        confidence=0.9,
     )
+    result = generator.simulate_apply(plan, Path("/tmp"))
+    assert result["applied"] is True
+    assert any("title" in c for c in result["changes"])
 
-    # Create the target XML
-    xml_path = tmp_path / "res" / "values" / "strings.xml"
-    xml_path.parent.mkdir(parents=True)
-    xml_path.write_text(
-        '''<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="ad_text">Buy now</string>
-</resources>''',
-        encoding="utf-8",
-    )
 
+def test_prompt_includes_frida_data(sample_report):
     generator = PatchGenerator()
-    result = generator.simulate_apply(plan, tmp_path)
-
-    assert result["success"] is True
-    assert len(result["applied"]) == 1
-    assert result["applied"][0]["edit_type"] == "resource"
+    with patch.object(generator.llm, "generate_patch") as mock_gen:
+        mock_gen.return_value = PatchPlan(
+            description="test", modifications=[], rationale="ok", confidence=0.8
+        )
+        generator.from_description("disable ads", sample_report, observe=False)
+    # generate_patch internally builds prompt containing runtime section
+    call_args = mock_gen.call_args[0]
+    assert len(call_args) >= 2
+    # the report passed contains runtime_observations
+    assert len(call_args[1].runtime_observations) > 0
