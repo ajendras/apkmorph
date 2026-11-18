@@ -27,6 +27,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 - Every change ships with a plain-English rationale, confidence score, and before/after diff
 - Fully local: no data leaves your machine; works with any Ollama model and optional GPU
 - One-click rebuild, zipalign, and signing (debug or custom keystore) produces a ready-to-install APK
+- Supports popular local models (Gemma 2, Phi 3, Code Llama) with automatic download on first use
 
 ## 🎬 Demo
 
@@ -47,7 +48,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 </tr>
 <tr>
 <td valign="top"><h3>📊 Visual Dashboard</h3><br>Streamlit UI shows component tree, patch history, confidence scores and export options</td>
-<td valign="top"><h3>🔒 Fully Local</h3><br>No data leaves your machine; works with any Ollama model and optional GPU acceleration</td>
+<td valign="top"><h3>🔒 Fully Local</h3><br>No data leaves your machine; works with llama3.2, Gemma 2, Phi 3, Code Llama (auto-download) and optional GPU acceleration</td>
 <td valign="top"><h3>🔬 Runtime Observation</h3><br>Frida scripts observe which methods, analytics and ad calls are actually used at runtime to inform the LLM before generating patches</td>
 </tr>
 </table>
@@ -57,7 +58,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 **Requirements**
 
 - Python ≥ 3.10
-- Ollama running with a pulled model (`ollama pull llama3.2`)
+- Ollama running (APK Morph will automatically download Gemma 2, Phi 3, Code Llama and other supported models on first use)
 - Apktool, zipalign and apksigner on your PATH (Android SDK build-tools)
 - Java runtime
 - Frida server on device/emulator (for runtime observation)
@@ -76,7 +77,7 @@ The CLI entry point `apkmorph` is automatically installed from `pyproject.toml`.
 apkmorph analyze sample.apk -o report.md
 
 # 2. Generate a patch plan from natural language (uses Frida runtime data)
-apkmorph patch "disable all analytics, remove ads and change app name" sample.apk --model llama3.2
+apkmorph patch "disable all analytics, remove ads and change app name" sample.apk --model gemma2
 
 # 3. Apply the plan and build a signed APK
 apkmorph apply
@@ -90,7 +91,7 @@ The resulting `patched_*.apk` is ready to install. All commands are defined in `
 
 ```bash
 apkmorph analyze myapp.apk
-apkmorph patch "remove splash screen, disable crash reporting and empty ad strings" myapp.apk --apply
+apkmorph patch "remove splash screen, disable crash reporting and empty ad strings" myapp.apk --model phi3 --apply
 apkmorph explain plan_abc123
 ```
 
@@ -113,7 +114,7 @@ analyzer = APKAnalyzer()
 report = analyzer.decompile("game.apk")
 report = analyzer.observe_runtime(report)  # observes live method calls via Frida
 
-generator = PatchGenerator(model="llama3.2")
+generator = PatchGenerator(model="gemma2")  # or phi3, codellama — auto-downloaded
 plan = generator.from_description("remove all ads and update app name", report)
 
 print(plan.rationale)
@@ -127,7 +128,7 @@ print("Signed APK:", final_apk)
 <details><summary>Advanced: custom keystore and simulation</summary>
 
 ```bash
-apkmorph patch "remove tracking and change strings" app.apk --apply
+apkmorph patch "remove tracking and change strings" app.apk --apply --model codellama
 apkmorph apply --plan-id plan_7f3a9c
 ```
 
@@ -144,7 +145,8 @@ builder.align_and_sign("unsigned.apk", keystore="release.jks")
 
 | Option                  | Default               | Description |
 |-------------------------|-----------------------|-------------|
-| `llm.default_model`     | `llama3.2`            | Ollama model used by `LLMClient` |
+| `llm.default_model`     | `llama3.2`            | Ollama model used by `LLMClient`; aliases gemma2/phi3/codellama also supported |
+| `llm.auto_download`     | `true`                | Automatically download supported models (Gemma 2, Phi 3, Code Llama) if missing |
 | `llm.temperature`       | `0.15`                | Controls determinism of patch generation |
 | `tools.apktool`         | (PATH)                | Full path to apktool binary |
 | `signing.use_debug`     | `true`                | Use `~/.android/debug.keystore` when no keystore is supplied |
@@ -166,7 +168,7 @@ flowchart TD
     Frida --> Report[AnalysisReport with runtime_observations]
     Report --> Generator[PatchGenerator.from_description]
     Generator --> LLM[LLMClient.query]
-    LLM --> Ollama[(Ollama<br>llama3.2)]
+    LLM --> Ollama[(Ollama<br>llama3.2 / gemma2 / phi3 / codellama)]
     Generator --> Plan[PatchPlan]
     Plan --> Validator[PatchGenerator.validate]
     Validator --> Editor[SmaliEditor + XML/ResourceEditor<br>read_method/apply_modification]
@@ -219,7 +221,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Add resource.arsc and XML intelligent editing with AI-suggested string changes
 - [x] Integrate Frida scripts to observe runtime behavior before suggesting patches
 - [x] Build interactive side-by-side Smali diff viewer with hover explanations
-- [ ] Support additional local models (Gemma2, Phi3, CodeLlama) with auto-download
+- [x] Support additional local models (Gemma2, Phi3, CodeLlama) with auto-download
 - [ ] Implement batch mode for applying the same natural-language patch to many APKs
 - [ ] Create simple plugin API so users can register custom patch types (e.g. theme injectors)
 - [ ] Add export of generated patches as reusable Python scripts or JSON templates

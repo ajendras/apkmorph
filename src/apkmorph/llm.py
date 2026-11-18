@@ -7,10 +7,11 @@ uses Frida runtime observations to target live-executed methods.
 """
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 import ollama
 from pydantic import ValidationError
+from rich.console import Console
 
 from apkmorph.models import AnalysisReport, PatchPlan
 
@@ -24,19 +25,65 @@ class LLMClient:
     suggesting XML edits, resource string changes (resources.arsc is
     rebuilt on next Apktool invocation) and using Frida runtime observations
     to make patches target only methods that actually execute.
+
+    Supports friendly aliases for Gemma 2, Phi 3 and Code Llama with
+    automatic download on first use.
     """
 
     DEFAULT_MODEL = "llama3.2"
     DEFAULT_TEMPERATURE = 0.15
     DEFAULT_CONTEXT = 12288
 
+    MODEL_ALIASES = {
+        "gemma2": "gemma2",
+        "phi3": "phi3",
+        "codellama": "codellama",
+        "code-llama": "codellama",
+    }
+
     def __init__(self, model: str | None = None) -> None:
         """Initialize with an Ollama model name.
 
         Args:
-            model: Ollama model tag (defaults to llama3.2). Must be pulled locally.
+            model: Ollama model tag (defaults to llama3.2). Friendly aliases
+                   for gemma2, phi3 and codellama are supported and will be
+                   auto-downloaded if not present locally.
         """
         self.model = model or self.DEFAULT_MODEL
+        self.console = Console()
+        self._model_ready = False
+
+    def _ensure_model(self, model: Optional[str] = None) -> None:
+        """Ensure the model (or alias) is available locally by pulling it from
+        Ollama if necessary. Supports Gemma2, Phi3 and CodeLlama out of the box.
+        """
+        target = model or self.model
+        if target.lower() in self.MODEL_ALIASES:
+            target = self.MODEL_ALIASES[target.lower()]
+            if model is None:
+                self.model = target
+
+        try:
+            resp = ollama.list()
+            available_models = [m["name"] for m in resp.get("models", [])]
+            if any(
+                target == m or target in m or m.startswith(target.split(":")[0])
+                for m in available_models
+            ):
+                return
+
+            self.console.print(
+                f"[yellow]Model [bold]{target}[/bold] not found locally. "
+                "Auto-downloading...[/yellow]"
+            )
+            self.console.print("[dim](first-time use may take 1-5 minutes)[/dim]")
+            ollama.pull(target)
+            self.console.print(f"[green]✓[/green] {target} is now available.")
+        except Exception as exc:
+            self.console.print(f"[red]Auto-download failed: {exc}[/red]")
+            self.console.print(
+                "[yellow]Ensure 'ollama serve' is running and you have internet access.[/yellow]"
+            )
 
     def query(
         self,
@@ -59,6 +106,10 @@ class LLMClient:
         """
         if not prompt or not prompt.strip():
             raise ValueError("Prompt cannot be empty")
+
+        if not self._model_ready:
+            self._ensure_model(model)
+            self._model_ready = True
 
         use_model = model or self.model
         messages = []

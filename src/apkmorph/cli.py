@@ -157,7 +157,7 @@ def patch(
         "llama3.2",
         "--model",
         "-m",
-        help="Ollama model to use for patch generation",
+        help="Ollama model to use (llama3.2, gemma2, phi3, codellama supported with auto-download)",
     ),
     apply_now: bool = typer.Option(
         False,
@@ -168,6 +168,7 @@ def patch(
     """Translate a plain-English request into a precise PatchPlan using a local LLM.
 
     The plan contains minimal Smali/XML edits with confidence scores and rationale.
+    Gemma 2, Phi 3 and Code Llama are supported with automatic download.
     """
     console.print(
         f'Generating intelligent patch for request: "[italic]{description}[/italic]"'
