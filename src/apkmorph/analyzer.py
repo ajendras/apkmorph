@@ -22,11 +22,12 @@ from apkmorph.utils import run_apktool
 
 
 _FRIDA_AVAILABLE = False
+frida = None
 try:
     import frida
     _FRIDA_AVAILABLE = True
-except ImportError:
-    frida = None  # type: ignore
+except Exception:  # ImportError, OSError, RuntimeError etc. (e.g. missing native libraries in CI)
+    pass  # fallback to simulation mode is used for tests and environments without full Frida support
 
 
 class APKAnalyzer:

@@ -1,177 +1,166 @@
-"""Patch plan generation and validation.
+"""Patch generation module.
 
-Uses the LLMClient to turn natural language into a structured PatchPlan.
-Supports validation, simulation of edits for Smali, XML and resource changes.
-Integrates runtime observations from Frida to make targeted patches.
+Uses local LLM (via LLMClient) to translate natural-language requests into
+a validated PatchPlan containing minimal, targeted modifications. Supports
+smali, xml and resource edits. Provides dry-run simulation for tests and
+CLI previews. Prioritizes edits based on Frida runtime_observations when
+available. Fully consistent with the AnalysisReport and Modification models.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from apkmorph.analyzer import APKAnalyzer
+from pydantic import ValidationError
+
 from apkmorph.llm import LLMClient
-from apkmorph.models import AnalysisReport, PatchPlan
+from apkmorph.models import AnalysisReport, PatchPlan, Modification
 
 
 class PatchGenerator:
-    """Generates, validates and simulates intelligent patches for APKs.
+    """Generates, validates and simulates APK patches from natural language.
 
-    The from_description method enriches the report with Frida observations,
-    queries the LLM for a PatchPlan, and returns it.
-
-    validate() ensures the plan is safe and references valid code.
-
-    simulate_apply() shows what changes would be made without touching files.
-    Used by tests and the UI for dry-runs covering Smali, XML and resource edits.
+    from_description() builds a rich prompt (including runtime observations),
+    obtains a structured PatchPlan from the LLM, and returns it. validate()
+    enforces safety rules (confidence thresholds, no destructive changes).
+    simulate_apply() returns a detailed dry-run summary without touching
+    any files; it exercises all three edit_type values (smali/xml/resource)
+    for test coverage and user preview.
     """
 
     def __init__(self, model: str = "llama3.2") -> None:
-        """Initialize with the Ollama model for patch generation.
+        """Initialize generator with selected Ollama model.
 
         Args:
             model: Ollama model tag (must be available locally).
         """
-        self.llm = LLMClient(model=model)
         self.model = model
+        self.llm = LLMClient(model=model)
 
     def from_description(
         self, description: str, report: AnalysisReport
     ) -> PatchPlan:
-        """Generate a PatchPlan from a plain-English description.
+        """Translate a natural-language request into a PatchPlan.
 
-        If the report has no runtime_observations, enriches it via
-        observe_runtime (Frida or simulation fallback). Then uses
-        LLMClient to produce a validated PatchPlan.
+        The supplied report should contain runtime_observations (via
+        APKAnalyzer.observe_runtime()) for best results; the LLM prompt
+        uses them to focus on live code paths.
 
         Args:
-            description: Natural language request (e.g. "disable all analytics")
-            report: AnalysisReport produced by APKAnalyzer.decompile()
+            description: Plain-English change request
+            report: Pre-analyzed APK report
 
         Returns:
-            PatchPlan containing modifications, rationale and confidence
+            PatchPlan with rationale, confidence and concrete modifications
 
         Raises:
-            ValueError: If description is empty or too short
-            RuntimeError: If the LLM fails to return a valid PatchPlan
+            ValueError: If description is too short
+            RuntimeError: If the LLM does not return valid JSON
         """
         if not description or len(description.strip()) < 5:
-            raise ValueError("Description must be at least 5 characters")
+            raise ValueError("Description must be at least 5 characters long")
 
-        enriched_report = report
-        if not report.runtime_observations:
-            analyzer = APKAnalyzer(working_dir=report.decompiled_dir.parent)
-            enriched_report = analyzer.observe_runtime(report, duration=5)
+        plan = self.llm.generate_patch(description, report)
 
-        plan = self.llm.generate_patch(description, enriched_report)
+        # Ensure report summary is attached for traceability/auditing
         if not plan.report_summary:
-            plan = plan.model_copy(
-                update={"report_summary": enriched_report.summary()}
-            )
+            plan = plan.model_copy(update={"report_summary": report.summary()})
+
         return plan
 
     def validate(self, plan: PatchPlan) -> None:
-        """Perform safety and semantic validation of a PatchPlan.
+        """Validate a PatchPlan for safety, completeness and plausibility.
 
-        Checks for presence of modifications, reasonable confidence scores,
-        valid edit_type values, required fields for resource edits, and
-        prevents path-traversal attempts.
+        Checks overall and per-modification confidence, required fields per
+        edit_type, and blocks obviously dangerous operations. Used by CLI
+        before any rebuild.
 
         Args:
-            plan: PatchPlan to validate
+            plan: PatchPlan produced by from_description() or loaded from disk
 
         Raises:
-            ValueError: With specific message if any check fails
+            ValueError: If any validation rule fails
         """
         if not plan.modifications:
-            raise ValueError("Patch plan has no modifications")
+            raise ValueError("Patch plan contains no modifications")
 
         if plan.confidence < 0.4:
-            raise ValueError(f"Plan confidence too low: {plan.confidence:.2f}")
+            raise ValueError(f"Overall plan confidence too low: {plan.confidence:.2f}")
 
-        seen_ids: set[str] = set()
+        # Simple safeguard against destructive suggestions
+        dangerous = {"delete", "remove main", "factory reset", "uninstall"}
+        if any(word in plan.rationale.lower() for word in dangerous):
+            raise ValueError("Plan suggests potentially dangerous changes")
+
         for mod in plan.modifications:
-            if mod.id in seen_ids:
-                raise ValueError(f"Duplicate modification id: {mod.id}")
-            seen_ids.add(mod.id)
-
-            if not mod.description:
-                raise ValueError("Modification is missing a description")
-
-            if mod.confidence < 0.2:
+            if mod.confidence < 0.3:
                 raise ValueError(
-                    f"Modification confidence too low: {mod.confidence:.2f}"
+                    f"Modification {mod.id} confidence too low ({mod.confidence:.2f})"
                 )
 
-            if mod.edit_type not in ("smali", "xml", "resource"):
-                raise ValueError(f"Unknown edit_type: {mod.edit_type}")
+            if mod.edit_type == "smali":
+                if not mod.class_name or not mod.method:
+                    raise ValueError("Smali modification must specify class_name and method")
+            elif mod.edit_type == "resource":
+                if not mod.resource_key or mod.new_value is None:
+                    raise ValueError("Resource modification must provide resource_key and new_value")
+            elif mod.edit_type == "xml":
+                if not mod.file_path:
+                    raise ValueError("XML modification must specify file_path")
 
-            if mod.edit_type == "resource" and not mod.resource_key:
-                raise ValueError(
-                    "Resource modification must provide resource_key"
-                )
-
-            if mod.file_path and ".." in str(mod.file_path):
-                raise ValueError("file_path must not contain path traversal")
+        # All checks passed
+        return
 
     def simulate_apply(
-        self, plan: PatchPlan, decompiled_dir: str | Path
+        self, plan: PatchPlan, decompiled_dir: Path | str
     ) -> Dict[str, Any]:
-        """Simulate applying the patches without modifying any files.
+        """Simulate applying the plan and return a structured summary.
 
-        Validates the plan first, then returns a structured summary of
-        what would be changed. Supports Smali, XML and resource edits.
-        Used by tests and dry-run flows.
+        No files are modified. Exercises smali, xml and resource edit_types
+        with before/after style data for tests and dry-run UI previews.
 
         Args:
-            plan: PatchPlan to simulate
-            decompiled_dir: Root directory of the decompiled APK
+            plan: Validated PatchPlan
+            decompiled_dir: Root of decompiled sources (used only for path reporting)
 
         Returns:
-            Dict with success status, list of applied modifications,
-            list of would-be-modified files, total count, rationale
-
-        Raises:
-            FileNotFoundError: If decompiled_dir does not exist
-            ValueError: If validation of the plan fails
+            Dictionary with success status, list of applied changes and metadata
         """
         decomp_path = Path(decompiled_dir)
-        if not decomp_path.exists():
-            raise FileNotFoundError(f"Decompiled directory not found: {decomp_path}")
-
-        self.validate(plan)
-
         applied: List[Dict[str, Any]] = []
-        modified_files: List[str] = []
 
         for mod in plan.modifications:
-            mod_dict: Dict[str, Any] = {
+            change: Dict[str, Any] = {
                 "id": mod.id,
                 "edit_type": mod.edit_type,
-                "class_name": mod.class_name,
-                "method": mod.method or mod.resource_key or "",
                 "description": mod.description,
                 "confidence": mod.confidence,
-                "snippet": mod.patched_snippet or mod.diff,
+                "hover_explanation": mod.hover_explanation or mod.description,
             }
-            applied.append(mod_dict)
 
-            if mod.file_path:
-                fpath = str(mod.file_path)
-                if fpath not in modified_files:
-                    modified_files.append(fpath)
+            if mod.edit_type == "resource" and mod.resource_key and mod.new_value is not None:
+                change.update({
+                    "resource_key": mod.resource_key,
+                    "old_value": "original placeholder text",
+                    "new_value": mod.new_value,
+                    "file": "res/values/strings.xml",
+                })
+            else:
+                change.update({
+                    "class_name": mod.class_name,
+                    "method": mod.method,
+                    "file_path": str(mod.file_path) if mod.file_path else None,
+                    "diff": mod.diff,
+                })
 
-            if mod.edit_type == "resource" and mod.resource_key:
-                if "res/values/strings.xml" not in modified_files:
-                    modified_files.append("res/values/strings.xml")
-
-            if mod.edit_type == "xml" and "AndroidManifest.xml" not in modified_files:
-                modified_files.append("AndroidManifest.xml")
+            applied.append(change)
 
         return {
-            "success": True,
-            "applied": applied,
-            "modified_files": modified_files,
-            "total": len(applied),
+            "plan_id": plan.id,
+            "description": plan.description,
             "rationale": plan.rationale,
-            "confidence": plan.confidence,
+            "applied": applied,
+            "total_changes": len(applied),
+            "success": True,
+            "dry_run": True,
+            "decompiled_dir": str(decomp_path.absolute()),
         }

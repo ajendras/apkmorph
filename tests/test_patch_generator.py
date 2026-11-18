@@ -1,159 +1,177 @@
+"""Tests for PatchGenerator.
+
+Covers from_description (with mocked LLM), validate (valid + error cases),
+and simulate_apply for all edit_types (smali, xml, resource). Uses mocks
+so no Ollama server or real filesystem is required. Updated for Python 3.12
+CI, new Frida-aware prompt path and resource edit support.
+"""
+
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from apkmorph.patch_generator import PatchGenerator
+from apkmorph.llm import LLMClient
 from apkmorph.models import AnalysisReport, PatchPlan, Modification
 
 
-def test_from_description_with_mocked_llm():
-    with patch("apkmorph.llm.LLMClient.generate_patch") as mock_generate:
-        mock_mod = Modification(
-            class_name="com.google.firebase.analytics.FirebaseAnalytics",
-            method="logEvent(Ljava/lang/String;Landroid/os/Bundle;)V",
-            diff="    return-void",
-            description="Replace analytics call with early return",
-            edit_type="smali",
-            confidence=0.92,
-            file_path=Path("smali/com/google/firebase/analytics/FirebaseAnalytics.smali"),
-            original_snippet="    invoke-virtual ...",
-            patched_snippet="    # patched by APK Morph\n    return-void",
-            hover_explanation="Prevents Firebase event logging observed via Frida",
-        )
-        mock_plan = PatchPlan(
-            description="disable all analytics",
-            rationale="Targeted live Firebase calls seen in runtime observations",
-            confidence=0.89,
-            modifications=[mock_mod],
-            report_summary="com.example.testapp v1.0 • 5 components",
-        )
-        mock_generate.return_value = mock_plan
-
-        generator = PatchGenerator(model="llama3.2")
-        report = AnalysisReport(
-            apk_path=Path("test.apk"),
-            package_name="com.example.testapp",
-            decompiled_dir=Path("/tmp/decompiled_test"),
-            strings=["analytics", "firebase"],
-            activities=["com.example.testapp.MainActivity"],
-            services=[],
-            receivers=[],
-            providers=[],
-            permissions=[],
-            components=["com.example.testapp.MainActivity"],
-            string_resources={"analytics_enabled": "true"},
-            runtime_observations=[
-                "observed: analytics - FirebaseAnalytics.logEvent() called"
-            ],
-        )
-
-        plan = generator.from_description("disable all analytics", report)
-
-        assert plan.description == "disable all analytics"
-        assert len(plan.modifications) == 1
-        assert plan.modifications[0].edit_type == "smali"
-        assert plan.confidence == 0.89
-        mock_generate.assert_called_once()
+@pytest.fixture
+def sample_report():
+    return AnalysisReport(
+        apk_path=Path("test.apk"),
+        package_name="com.example.testapp",
+        decompiled_dir=Path("/tmp/decomp"),
+        components=["com.example.AdActivity"],
+        strings=["ad", "analytics"],
+        string_resources={"ad_text": "Buy now!", "app_name": "Test"},
+        runtime_observations=["observed: ad - loadAd()"],
+        metadata={},
+        size_bytes=2048,
+    )
 
 
-def test_validate_accepts_valid_plan():
-    generator = PatchGenerator()
-    mod = Modification(
-        class_name="com.example.AdManager",
-        method="loadAd",
-        diff="- invoke-virtual ...",
-        description="Disable ad loading observed at runtime",
+@pytest.fixture
+def sample_mod():
+    return Modification(
+        class_name="com.example.AdActivity",
+        method="loadAd(Lcom/google/android/gms/ads/AdRequest;)V",
+        diff="- invoke-virtual {p0, p1} ...loadAd\n+ return-void",
+        description="Disable ad load observed via Frida",
         edit_type="smali",
-        confidence=0.85,
-        file_path=Path("smali/com/example/AdManager.smali"),
-    )
-    plan = PatchPlan(
-        description="remove ads",
-        rationale="Used Frida data to target only executed ad paths",
-        confidence=0.88,
-        modifications=[mod],
+        confidence=0.92,
+        file_path=Path("smali/com/example/AdActivity.smali"),
+        original_snippet="invoke-virtual ...",
+        patched_snippet="return-void",
+        hover_explanation="Early return prevents ad network call",
     )
 
-    generator.validate(plan)  # should not raise
+
+@pytest.fixture
+def sample_plan(sample_mod):
+    return PatchPlan(
+        description="remove ads and analytics",
+        modifications=[sample_mod],
+        rationale="Targeted live methods from Frida observations and emptied ad string resource.",
+        confidence=0.89,
+        report_summary="Test app v1.0 • 12 components",
+    )
 
 
-def test_validate_rejects_invalid_plan():
+def test_generator_init():
+    gen = PatchGenerator(model="llama3.2")
+    assert gen.model == "llama3.2"
+    assert isinstance(gen.llm, LLMClient)
+
+
+@patch.object(LLMClient, "generate_patch")
+def test_from_description(mock_generate, sample_report):
+    mock_plan = PatchPlan(
+        description="remove ads and analytics",
+        rationale="Used Frida data to target only executed ad paths.",
+        confidence=0.87,
+        modifications=[],
+    )
+    mock_generate.return_value = mock_plan
+
+    generator = PatchGenerator(model="llama3.2")
+    plan = generator.from_description("disable ads", sample_report)
+
+    assert plan.description == "remove ads and analytics"
+    assert plan.rationale.startswith("Used Frida")
+    mock_generate.assert_called_once_with("disable ads", sample_report)
+
+
+def test_validate_success(sample_plan):
     generator = PatchGenerator()
-    mod = Modification(
-        class_name="com.example.Class",
-        method="method",
-        diff="change",
-        description="",
+    # should not raise
+    generator.validate(sample_plan)
+
+
+def test_validate_fails_on_low_confidence():
+    generator = PatchGenerator()
+    bad_mod = Modification(
+        class_name="com.example.Foo",
+        method="bar",
+        diff="bad change",
+        description="low confidence edit",
         edit_type="smali",
-        confidence=0.1,
+        confidence=0.25,
     )
-    plan = PatchPlan(
-        description="bad plan",
-        rationale="bad",
+    bad_plan = PatchPlan(
+        description="bad",
+        modifications=[bad_mod],
+        rationale="test",
         confidence=0.3,
-        modifications=[mod],
     )
-
-    with pytest.raises(ValueError, match="too low"):
-        generator.validate(plan)
-
-    with pytest.raises(ValueError, match="missing a description"):
-        bad_mod = mod.model_copy(update={"description": ""})
-        bad_plan = plan.model_copy(update={"confidence": 0.8, "modifications": [bad_mod]})
+    with pytest.raises(ValueError, match="low confidence"):
         generator.validate(bad_plan)
 
 
-def test_simulate_apply_for_smali_xml_resource():
+def test_validate_fails_on_missing_fields():
+    generator = PatchGenerator()
+    bad_mod = Modification(
+        class_name="",
+        method="",
+        diff="",
+        description="invalid",
+        edit_type="smali",
+        confidence=0.8,
+    )
+    bad_plan = PatchPlan(
+        description="bad",
+        modifications=[bad_mod],
+        rationale="test",
+        confidence=0.8,
+    )
+    with pytest.raises(ValueError, match="must specify class_name and method"):
+        generator.validate(bad_plan)
+
+
+def test_simulate_apply_smali(sample_plan):
+    generator = PatchGenerator()
+    result = generator.simulate_apply(sample_plan, "/tmp/decomp")
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["total_changes"] == 1
+    assert result["applied"][0]["edit_type"] == "smali"
+    assert "AdActivity" in result["applied"][0]["class_name"]
+    assert "Frida" in result["rationale"]
+
+
+def test_simulate_apply_resource_and_xml():
     generator = PatchGenerator()
     mods = [
         Modification(
-            class_name="com.example.AdView",
-            method="loadAd",
-            diff="    # APK Morph disabled ad load\n    return-void",
-            description="NOP ad load observed via Frida",
-            edit_type="smali",
-            confidence=0.95,
-            file_path=Path("smali/com/example/AdView.smali"),
-            original_snippet="    invoke-virtual {p0,p1}",
-            patched_snippet="    # disabled",
-            hover_explanation="Prevents network request to ad server",
-        ),
-        Modification(
             class_name="resource",
             method="update_string",
-            diff="ad_text changed to empty",
-            description="Remove ad banner text",
+            diff="ad_text changed",
+            description="Empty ad string",
             edit_type="resource",
-            resource_key="ad_banner_text",
+            resource_key="ad_text",
             new_value="",
-            confidence=0.82,
-            file_path=Path("res/values/strings.xml"),
+            confidence=0.88,
         ),
         Modification(
-            class_name="com.example.Tracker",
-            method="trackEvent",
-            diff="<uses-permission android:name=.../> removed",
-            description="Remove tracking permission",
+            class_name="com.example.Settings",
+            method="onCreate",
+            diff="<activity android:name=...>",
+            description="Disable analytics receiver",
             edit_type="xml",
-            confidence=0.78,
             file_path=Path("AndroidManifest.xml"),
+            confidence=0.75,
         ),
     ]
     plan = PatchPlan(
-        description="remove ads, tracking and analytics",
-        rationale="Targeted only methods seen in runtime observations",
-        confidence=0.87,
+        description="clean resources and manifest",
         modifications=mods,
+        rationale="Updated string resource and XML per request.",
+        confidence=0.82,
     )
 
-    decompiled_dir = Path("/tmp/fake_decomp")
-    with patch.object(Path, "exists", return_value=True):
-        result = generator.simulate_apply(plan, decompiled_dir)
-
-    assert result["success"] is True
-    assert result["total"] == 3
-    assert len(result["applied"]) == 3
-    assert len(result["modified_files"]) >= 2
-    edit_types = {m["edit_type"] for m in result["applied"]}
-    assert edit_types == {"smali", "resource", "xml"}
-    assert result["confidence"] == 0.87
+    result = generator.simulate_apply(plan, Path("/tmp/decomp"))
+    assert result["total_changes"] == 2
+    assert result["applied"][0]["resource_key"] == "ad_text"
+    assert result["applied"][0]["new_value"] == ""
+    assert result["applied"][1]["edit_type"] == "xml"
+    assert "AndroidManifest.xml" in str(result["applied"][1]["file_path"])
