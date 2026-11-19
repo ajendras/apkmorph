@@ -81,6 +81,9 @@ apkmorph patch "disable all analytics, remove ads and change app name" sample.ap
 
 # 3. Apply the plan and build a signed APK
 apkmorph apply
+
+# 4. Batch-apply the same natural-language patch to many APKs
+apkmorph batch "disable all analytics and remove ads" *.apk --output-dir ./patched_batch --model phi3
 ```
 
 The resulting `patched_*.apk` is ready to install. All commands are defined in `src/apkmorph/cli.py`.
@@ -93,6 +96,7 @@ The resulting `patched_*.apk` is ready to install. All commands are defined in `
 apkmorph analyze myapp.apk
 apkmorph patch "remove splash screen, disable crash reporting and empty ad strings" myapp.apk --model phi3 --apply
 apkmorph explain plan_abc123
+apkmorph batch "disable analytics and remove ads" app1.apk app2.apk --output-dir ./patched --no-observe
 ```
 
 **Launch the Streamlit dashboard**
@@ -124,6 +128,17 @@ builder = APKBuilder()
 final_apk = builder.rebuild_and_sign(str(report.decompiled_dir))
 print("Signed APK:", final_apk)
 ```
+
+**Batch mode**
+
+Process many APKs with the identical natural-language request. Each APK receives its own decompilation, runtime observation (optional), LLM-generated plan (tailored to its code), modification application, and signed output.
+
+```bash
+apkmorph batch "disable all analytics, remove ads and update app name" app1.apk app2.apk app3.apk \
+  --output-dir ./patched_batch --model phi3
+```
+
+The command prints a rich summary table and places `patched_*.apk` files in the requested directory.
 
 <details><summary>Advanced: custom keystore and simulation</summary>
 
@@ -189,10 +204,10 @@ flowchart TD
 ├── pyproject.toml                 # Metadata, dependencies, CLI entry point
 ├── config.toml.example            # LLM, tools, signing and UI defaults
 ├── src/apkmorph/
-│   ├── cli.py                     # Typer commands: analyze, patch, apply, explain, ui
+│   ├── cli.py                     # Typer commands: analyze, patch, apply, explain, ui, batch
 │   ├── analyzer.py                # APKAnalyzer with decompile(), find_by_keyword() and string resource extraction
 │   ├── llm.py                     # LLMClient.query() and patch prompt templates (now XML/resource aware)
-│   ├── patch_generator.py         # PatchGenerator.from_description() + validate() + simulate_apply()
+│   ├── patch_generator.py         # PatchGenerator.from_description() + validate() + simulate_apply() + batch()
 │   ├── models.py                  # AnalysisReport, PatchPlan, Modification (Pydantic) with edit_type support
 │   ├── smali.py                   # SmaliEditor (extended for XML and resource string edits)
 │   ├── builder.py                 # APKBuilder.rebuild(), align_and_sign(), rebuild_and_sign()
@@ -200,7 +215,7 @@ flowchart TD
 │   └── utils.py                   # run_apktool(), generate_report_md(), safe_copytree()
 ├── tests/
 │   ├── test_analyzer.py           # Tests decompilation, component extraction, keyword search and string_resources
-│   └── test_patch_generator.py    # Prompt construction, validation, simulate_apply() for Smali+XML+resource
+│   └── test_patch_generator.py    # Prompt construction, validation, simulate_apply() for Smali+XML+resource + batch tests
 ├── examples/
 │   └── remove_ads.py              # Runnable library example using natural-language API
 └── LICENSE
@@ -212,7 +227,7 @@ flowchart TD
 pytest -q
 ```
 
-Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, and the new Frida runtime observation path (with realistic simulation fallback). Run with `pytest -q --cov` using the config in `pyproject.toml`.
+Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the new Frida runtime observation path (with realistic simulation fallback). Run with `pytest -q --cov` using the config in `pyproject.toml`.
 
 ## 📍 Roadmap
 
@@ -222,7 +237,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Integrate Frida scripts to observe runtime behavior before suggesting patches
 - [x] Build interactive side-by-side Smali diff viewer with hover explanations
 - [x] Support additional local models (Gemma2, Phi3, CodeLlama) with auto-download
-- [ ] Implement batch mode for applying the same natural-language patch to many APKs
+- [x] Implement batch mode for applying the same natural-language patch to many APKs
 - [ ] Create simple plugin API so users can register custom patch types (e.g. theme injectors)
 - [ ] Add export of generated patches as reusable Python scripts or JSON templates
 - [ ] Enable direct push to connected Android device with install + launch

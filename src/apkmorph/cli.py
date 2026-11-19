@@ -9,7 +9,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from pydantic import ValidationError
@@ -214,7 +214,7 @@ def patch(
         console.print(f"\n[bold green]Patch plan {plan.id} saved.[/bold green]")
 
         if apply_now:
-            _apply_plan(plan, apk_path)
+            _apply_plan(plan, apk_path, report=report)
 
     except ValidationError as exc:
         console.print("[red]LLM produced an invalid PatchPlan.[/red]")
@@ -225,38 +225,25 @@ def patch(
         raise typer.Exit(2) from exc
 
 
-def _apply_plan(plan: PatchPlan, original_apk: Optional[Path] = None) -> None:
+def _apply_plan(
+    plan: PatchPlan, original_apk: Optional[Path] = None, report: Optional[AnalysisReport] = None
+) -> None:
     """Apply all modifications from a PatchPlan and rebuild the APK.
 
-    Uses SmaliEditor (via PatchGenerator.validate) then APKBuilder.
+    Uses PatchGenerator.apply_plan (which performs edits via _apply_modifications).
     """
     console.print("[bold]Applying patches...[/bold]")
 
     try:
-        # Validate plan safety before touching files
         generator = PatchGenerator()
-        generator.validate(plan)
-
-        builder = APKBuilder()
-
-        # In a full implementation the decompiled directory would be stored
-        # in the report or plan. For this runnable CLI we use a conventional
-        # location that the analyzer creates.
-        decompiled_root = Path("decompiled") / plan.id
-        if not decompiled_root.exists():
-            console.print(
-                "[yellow]Decompiled sources not found. "
-                "Run analyze first or ensure analyzer leaves output in expected location.[/yellow]"
-            )
+        if report is None and original_apk is not None:
+            analyzer = APKAnalyzer()
+            report = analyzer.decompile(str(original_apk))
+        if report is None:
+            console.print("[yellow]No decompiled report available, skipping edit phase.[/yellow]")
             return
 
-        output_apk = Path(f"patched_{plan.id}_{datetime.now():%Y%m%d_%H%M}.apk")
-
-        builder.rebuild(
-            decompiled_dir=str(decompiled_root),
-            output_apk=str(output_apk),
-        )
-        builder.align_and_sign(str(output_apk), keystore=None)
+        output_apk = generator.apply_plan(plan, report)
 
         console.print(
             Panel(
@@ -311,6 +298,67 @@ def explain(
         if mod.diff.strip():
             console.print(Syntax(mod.diff, "smali", line_numbers=True, word_wrap=True))
         console.print("─" * 60)
+
+
+@app.command()
+def batch(
+    description: str = typer.Argument(
+        ...,
+        help='Natural language request to apply to all APKs, e.g. "disable all analytics"',
+    ),
+    apk_paths: List[Path] = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="One or more .apk files (use *.apk for glob in shell)",
+    ),
+    output_dir: Path = typer.Option(
+        Path("batch_patched"),
+        "--output-dir",
+        "-o",
+        help="Output directory for all patched APKs",
+        dir_okay=True,
+        file_okay=False,
+    ),
+    model: str = typer.Option(
+        "llama3.2",
+        "--model",
+        "-m",
+        help="Ollama model",
+    ),
+    no_observe: bool = typer.Option(
+        False,
+        "--no-observe",
+        help="Skip Frida runtime observation",
+    ),
+) -> None:
+    """Apply the same natural-language patch description to multiple APKs in one command.
+
+    Each APK gets its own analysis, LLM-generated plan (tailored to its code and runtime data),
+    modifications applied, and signed APK produced in the output directory.
+    """
+    console.print(
+        f"[bold]Batch patching {len(apk_paths)} APKs with request:[/bold] [italic]{description}[/italic]"
+    )
+    console.print(f"Output directory: {output_dir.resolve()}")
+
+    try:
+        generator = PatchGenerator(model=model)
+        results = generator.batch(
+            description=description,
+            apk_paths=[str(p) for p in apk_paths],
+            output_dir=output_dir,
+            model=model,
+            observe_runtime=not no_observe,
+        )
+
+        success_count = sum(1 for r in results if r.get("success", False))
+        console.print(
+            f"\n[bold green]Batch complete: {success_count}/{len(apk_paths)} APKs successfully patched.[/bold green]"
+        )
+    except Exception as exc:
+        console.print(f"[red]Batch failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 @app.command()
