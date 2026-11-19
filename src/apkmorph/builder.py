@@ -56,12 +56,13 @@ class APKBuilder:
 
         console_msg = f"[blue]Rebuilding with Apktool → {output_path.name}[/blue]"
         try:
-            # Use the shared utility; --force-stop prevents resource conflicts
+            # -f forces overwrite; no --force-stop (invalid flag). Apktool
+            # will regenerate resources.arsc after any XML/string edits.
             run_apktool(
-                ["b", str(decomp_path), "-o", str(output_path), "-f", "--force-stop"]
+                ["b", str(decomp_path), "-o", str(output_path), "-f"]
             )
         except subprocess.CalledProcessError as exc:
-            stderr = getattr(exc, "stderr", b"").decode()
+            stderr = getattr(exc, "stderr", b"").decode(errors="replace")
             raise RuntimeError(f"Apktool build failed:\n{stderr}") from exc
         except FileNotFoundError as exc:
             raise RuntimeError(
