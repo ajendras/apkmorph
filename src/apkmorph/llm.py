@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from rich.console import Console
 
 from apkmorph.models import AnalysisReport, PatchPlan
+from apkmorph.plugins import list_custom_patch_types
 
 
 class LLMClient:
@@ -167,7 +168,10 @@ class LLMClient:
             "9. Prioritize modifications to methods and classes that appear in the "
             "runtime_observations. This ensures patches address actual executed code.\n"
             "10. Populate original_snippet, patched_snippet and hover_explanation for the "
-            "interactive side-by-side viewer.\n\n"
+            "interactive side-by-side viewer.\n"
+            "11. For custom patch types registered via the plugin API (e.g. theme_injector), "
+            "use the registered name as edit_type and populate the 'params' dictionary with "
+            "any required configuration. The registered handler will be invoked at apply time.\n\n"
             "Output only the JSON object. No markdown, no explanation outside the JSON."
         )
 
@@ -186,6 +190,16 @@ class LLMClient:
             else "No runtime observations available."
         )
 
+        custom_types = list_custom_patch_types()
+        custom_section = (
+            f"Registered custom patch types: {custom_types or 'none'}.\n"
+            "You may use any of them by setting edit_type to the exact registered name "
+            "and filling the 'params' dict with needed values (the plugin handler will "
+            "receive the Modification object)."
+            if custom_types
+            else "No custom patch plugins have been registered yet."
+        )
+
         return f"""Request: {description}
 
 {summary_md}
@@ -202,6 +216,8 @@ Available resource keys (use these for intelligent string edits):
 Runtime observations from Frida (use these to target live code paths):
 {runtime_section}
 
+{custom_section}
+
 Produce a PatchPlan that satisfies the request using the smallest number of targeted edits.
 Focus on:
 - Analytics / crash reporting SDK initialization (Smali) - prefer methods seen in Frida data
@@ -209,8 +225,9 @@ Focus on:
 - Unwanted permissions or receivers (XML)
 - Splash screen or onboarding flows
 - AI-suggested string changes (edit_type=resource) that will update resources.arsc
+- Any registered custom patch types (via the plugin API)
 
-You may return a mix of Smali, XML and resource modifications. When runtime observations
+You may return a mix of Smali, XML, resource and custom-plugin modifications. When runtime observations
 are present, make them the primary source of truth for method selection.
 
 Return ONLY a JSON object matching this structure (use realistic values from the report):

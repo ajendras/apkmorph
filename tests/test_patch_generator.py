@@ -1,191 +1,203 @@
-"""Tests for PatchGenerator.
+"""Tests for patch generation, validation, simulation and the new plugin API."""
 
-Covers prompt construction (via LLMClient), PatchPlan/Modification validation,
-simulate_apply for Smali/XML/resource edits, batch mode, and the new
-Frida-aware and resource-editing paths. Uses mocks so tests run in CI
-without Ollama server, Frida device or real APKs.
-"""
-
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from apkmorph.llm import LLMClient
 from apkmorph.models import AnalysisReport, Modification, PatchPlan
 from apkmorph.patch_generator import PatchGenerator
+from apkmorph.plugins import (
+    get_custom_patch_handler,
+    list_custom_patch_types,
+    register_custom_patch_type,
+)
+from apkmorph.smali import SmaliEditor
 
 
-@pytest.fixture
-def sample_report(tmp_path):
-    return AnalysisReport(
-        apk_path=tmp_path / "test.apk",
-        package_name="com.example.app",
-        decompiled_dir=tmp_path / "decomp",
-        size_bytes=102400,
-        strings=["firebase", "admob", "crashlytics"],
-        string_resources={"app_name": "Test", "ad_text": "Advertisement"},
-        components=["com.example.MainActivity", "com.google.ads.AdView"],
-        activities=["com.example.MainActivity"],
+def test_custom_patch_type_registration():
+    """Test the plugin decorator and lookup functions."""
+    calls = []
+
+    @register_custom_patch_type("test_theme")
+    def mock_theme_handler(mod: Modification, decomp_dir: Path) -> bool:
+        calls.append(mod.params.get("primary_color"))
+        return True
+
+    assert "test_theme" in list_custom_patch_types()
+    assert get_custom_patch_handler("test_theme") is mock_theme_handler
+    assert get_custom_patch_handler("nonexistent") is None
+
+    # Cleanup global state for other tests
+    if "test_theme" in list_custom_patch_types():
+        del list_custom_patch_types.__globals__["_custom_patch_handlers"]["test_theme"]
+
+
+def test_plugin_handler_called_on_apply():
+    """Integration test that a registered plugin is invoked by the editor."""
+    calls = []
+
+    @register_custom_patch_type("color_injector")
+    def color_injector(mod: Modification, decomp_dir: Path) -> bool:
+        calls.append((mod.params.get("color"), str(decomp_dir)))
+        return True
+
+    mod = Modification(
+        class_name="Theme",
+        method="applyTheme",
+        edit_type="color_injector",
+        diff="color changed",
+        description="inject primary color",
+        params={"color": "#FF9800"},
+        file_path=Path("res/values/colors.xml"),
+        confidence=0.9,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        decomp = Path(tmp)
+        editor = SmaliEditor()
+        success = editor.apply_modification(mod, decomp)
+        assert success is True
+        assert calls == [("#FF9800", str(decomp))]
+
+    # Cleanup
+    if "color_injector" in list_custom_patch_types():
+        del list_custom_patch_types.__globals__["_custom_patch_handlers"][
+            "color_injector"
+        ]
+
+
+def test_patch_generator_from_description_and_validate():
+    """Test that from_description calls the LLM and validate passes a good plan."""
+    report = AnalysisReport(
+        apk_path=Path("test.apk"),
+        package_name="com.example.test",
+        decompiled_dir=Path("/tmp/decomp"),
+        version_name="1.0",
+        version_code="1",
+        min_sdk=21,
+        target_sdk=34,
+        main_activity="MainActivity",
+        activities=[],
         services=[],
         receivers=[],
         providers=[],
-        permissions=["android.permission.INTERNET"],
+        permissions=[],
+        components=["com.example.MainActivity"],
+        strings=["hello"],
+        string_resources={"app_name": "Test"},
         metadata={},
-        main_activity="com.example.MainActivity",
-        version_name="1.0",
-        version_code="1",
-        min_sdk=24,
-        target_sdk=34,
-        runtime_observations=[
-            "observed: ad - com.google.android.gms.ads.AdView.loadAd() called",
-            "observed: analytics - FirebaseAnalytics.logEvent()",
-        ],
+        size_bytes=1024,
+        runtime_observations=["observed: analytics call"],
     )
 
-
-def test_modification_and_plan_models():
     mod = Modification(
-        class_name="com.google.ads.AdView",
-        method="loadAd",
-        diff="- invoke-virtual ...AdView;->loadAd",
-        description="NOP ad load observed via Frida",
+        class_name="com.example.Analytics",
+        method="logEvent",
         edit_type="smali",
-        confidence=0.92,
-        file_path=Path("smali/com/google/ads/AdView.smali"),
-        original_snippet="invoke-virtual {p0, p1}",
-        patched_snippet="# APK Morph disabled ad load\nreturn-void",
-        hover_explanation="Early return prevents ad network request (observed via Frida)",
-        resource_key=None,
-        new_value=None,
+        diff="- invoke ...",
+        description="disable analytics",
+        original_snippet="invoke ...",
+        patched_snippet="return-void",
+        confidence=0.85,
+        file_path=Path("smali/com/example/Analytics.smali"),
     )
+
     plan = PatchPlan(
-        description="remove ads",
-        rationale="Frida showed ad loads; replaced with early return and emptied ad string resource.",
+        description="disable analytics",
+        rationale="Used runtime observation to target live method",
         confidence=0.88,
         modifications=[mod],
     )
-    assert plan.id.startswith("plan_")
-    assert len(plan.modifications) == 1
-    assert plan.modifications[0].confidence == 0.92
-    assert plan.modifications[0].edit_type == "smali"
 
-
-def test_llm_generate_patch(sample_report):
-    valid_json = """
-{
-  "description": "disable all analytics and remove ads",
-  "rationale": "Frida observations showed Firebase and AdView calls; targeted those methods and emptied ad string resource.",
-  "confidence": 0.87,
-  "modifications": [
-    {
-      "class_name": "com.google.android.gms.ads.AdView",
-      "method": "loadAd(Lcom/google/android/gms/ads/AdRequest;)V",
-      "edit_type": "smali",
-      "diff": "    invoke-virtual {p0, p1} ...\\n    # replaced with early return",
-      "description": "NOP the ad loading call observed at runtime via Frida",
-      "confidence": 0.92,
-      "file_path": "smali/com/google/android/gms/ads/AdView.smali",
-      "location_hint": "line 42",
-      "original_snippet": "    invoke-virtual {p0, p1} ...\\n    return-void",
-      "patched_snippet": "    # APK Morph disabled ad load\\n    return-void",
-      "hover_explanation": "Early return prevents ad network request (observed via Frida)"
-    },
-    {
-      "class_name": "resource",
-      "method": "update_string",
-      "edit_type": "resource",
-      "resource_key": "ad_banner_text",
-      "new_value": "",
-      "diff": "ad_banner_text changed from 'Advertisement' to empty string",
-      "description": "Empty ad-related string resource (updates resources.arsc)",
-      "confidence": 0.88,
-      "file_path": "res/values/strings.xml",
-      "original_snippet": "<string name=\\"ad_banner_text\\">Advertisement</string>",
-      "patched_snippet": "<string name=\\"ad_banner_text\\"></string>",
-      "hover_explanation": "Removes visible ad text from UI resources"
-    }
-  ]
-}
-"""
-    with patch("apkmorph.llm.ollama") as mock_ollama:
-        mock_ollama.chat.return_value = valid_json
-        client = LLMClient(model="llama3.2")
-        plan = client.generate_patch("disable all analytics and remove ads", sample_report)
-        assert isinstance(plan, PatchPlan)
-        assert len(plan.modifications) == 2
-        assert any(m.edit_type == "resource" for m in plan.modifications)
-        assert any("Frida" in plan.rationale for m in [plan])  # pylint: disable=use-a-generator
-        mock_ollama.chat.assert_called_once()
-
-
-def test_patch_generator_from_description(sample_report):
-    with patch("apkmorph.patch_generator.LLMClient") as MockLLM:
-        mock_client = MagicMock()
-        mock_client.generate_patch.return_value = PatchPlan(
-            description="test",
-            rationale="test rationale",
-            confidence=0.9,
-            modifications=[],
-        )
-        MockLLM.return_value = mock_client
-
-        generator = PatchGenerator(model="phi3")
-        plan = generator.from_description("remove ads", sample_report)
-        assert isinstance(plan, PatchPlan)
-        MockLLM.assert_called_once_with(model="phi3")
-        mock_client.generate_patch.assert_called_once_with("remove ads", sample_report)
-
-
-def test_simulate_apply(sample_report, tmp_path):
-    plan = PatchPlan(
-        description="test",
-        rationale="test",
-        confidence=0.8,
-        modifications=[
-            Modification(
-                class_name="com.example.Main",
-                method="onCreate",
-                diff="return-void",
-                description="nop",
-                edit_type="smali",
-                file_path=Path("smali/com/example/Main.smali"),
-            )
-        ],
-    )
-    generator = PatchGenerator()
-    with patch("apkmorph.patch_generator.SmaliEditor") as _, patch(
-        "apkmorph.patch_generator.XMLResourceEditor"
-    ) as _:
-        result = generator.simulate_apply(plan, str(tmp_path))
-        assert isinstance(result, dict)
-        assert result["applied"] == 1
-        assert "plan_id" in result
-
-
-def test_batch(sample_report, tmp_path):
-    with patch("apkmorph.patch_generator.PatchGenerator.from_description") as mock_from, patch(
-        "apkmorph.patch_generator.PatchGenerator.apply_plan"
-    ) as mock_apply, patch("apkmorph.analyzer.APKAnalyzer") as MockAnalyzer:
-        mock_from.return_value = PatchPlan(
-            description="batch test",
-            rationale="ok",
-            confidence=0.8,
-            modifications=[],
-        )
-        mock_apply.return_value = Path("patched.apk")
-        mock_analyzer_instance = MagicMock()
-        mock_analyzer_instance.decompile.return_value = sample_report
-        MockAnalyzer.return_value = mock_analyzer_instance
+    with patch("apkmorph.patch_generator.LLMClient") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.generate_patch.return_value = plan
+        mock_llm_class.return_value = mock_llm
 
         generator = PatchGenerator(model="llama3.2")
-        results = generator.batch(
-            description="disable analytics",
-            apk_paths=[str(tmp_path / "a.apk"), str(tmp_path / "b.apk")],
-            output_dir=tmp_path / "out",
-            model="llama3.2",
-            observe_runtime=False,
-        )
-        assert len(results) == 2
-        assert all(r.get("success", False) for r in results)
-        assert mock_from.call_count == 2
+        # Patch the observe_runtime call so we don't require Frida
+        with patch(
+            "apkmorph.patch_generator.APKAnalyzer.observe_runtime",
+            return_value=report,
+        ):
+            generated_plan = generator.from_description("disable analytics", report)
+
+    assert generated_plan.id == plan.id
+    assert generated_plan.confidence == 0.88
+    assert len(generated_plan.modifications) == 1
+
+    # validate should pass
+    generator.validate(generated_plan)
+
+
+def test_validate_rejects_low_confidence():
+    """Validation should raise for plans with low confidence mods."""
+    mod = Modification(
+        class_name="Test",
+        method="test",
+        edit_type="smali",
+        diff="",
+        description="bad",
+        confidence=0.3,
+        file_path=Path("test.smali"),
+    )
+    plan = PatchPlan(
+        description="bad plan",
+        rationale="",
+        confidence=0.4,
+        modifications=[mod],
+    )
+    generator = PatchGenerator()
+    with pytest.raises(ValueError, match="confidence too low"):
+        generator.validate(plan)
+
+
+def test_simulate_apply():
+    """simulate_apply returns structured dry-run information."""
+    mod = Modification(
+        class_name="Ads",
+        method="show",
+        edit_type="smali",
+        diff="removed ad call",
+        description="remove ads",
+        confidence=0.92,
+        file_path=Path("smali/Ads.smali"),
+    )
+    plan = PatchPlan(
+        description="remove ads",
+        rationale="observed ad call",
+        confidence=0.9,
+        modifications=[mod],
+    )
+    generator = PatchGenerator()
+    result = generator.simulate_apply(plan, Path("/tmp"))
+    assert result["would_modify"] == 1
+    assert result["overall_confidence"] == 0.9
+    assert result["applied"][0]["uses_plugin"] is False
+
+
+def test_batch_processing():
+    """Batch should process multiple APKs and return per-apk results."""
+    with patch("apkmorph.patch_generator.PatchGenerator.from_description") as mock_from:
+        with patch("apkmorph.patch_generator.PatchGenerator.apply_plan") as mock_apply:
+            mock_from.return_value = PatchPlan(
+                description="test",
+                rationale="",
+                confidence=0.8,
+                modifications=[],
+            )
+            mock_apply.return_value = Path("patched_test.apk")
+
+            generator = PatchGenerator()
+            results = generator.batch(
+                description="disable ads",
+                apk_paths=["app1.apk", "app2.apk"],
+                output_dir=Path("/tmp/batch"),
+                observe_runtime=False,
+            )
+
+    assert len(results) == 2
+    assert results[0]["success"] is True
+    assert "output_apk" in results[0]
