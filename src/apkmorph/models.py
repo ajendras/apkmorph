@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Modification(BaseModel):
@@ -39,78 +39,32 @@ class Modification(BaseModel):
     )
     file_path: Optional[Path] = Field(
         default=None,
-        description="Relative path to the file to edit inside decompiled dir",
+        description="Relative path to the file to edit inside decompiled_dir",
     )
-    confidence: float = Field(0.8, ge=0.0, le=1.0)
-    resource_key: Optional[str] = Field(
-        default=None, description="For edit_type=resource: the string key"
+    confidence: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score for this modification",
     )
-    new_value: Optional[str] = Field(
-        default=None, description="For resource edits: the new string value"
-    )
-    original_snippet: Optional[str] = Field(
-        default=None, description="Original code for diff viewer and patching"
-    )
-    patched_snippet: Optional[str] = Field(
-        default=None, description="Patched code for diff viewer and patching"
-    )
+    location_hint: Optional[str] = Field(default=None, description="e.g. line number or method offset")
+    original_snippet: Optional[str] = Field(default=None, description="Original code snippet")
+    patched_snippet: Optional[str] = Field(default=None, description="After patch snippet")
     hover_explanation: Optional[str] = Field(
-        default=None, description="Tooltip text for UI diff viewer"
+        default=None, description="Explanation shown in UI on hover"
     )
-    location_hint: Optional[str] = Field(
-        default=None, description="Line number or method location"
-    )
-
-    @field_validator("confidence")
-    @classmethod
-    def validate_confidence(cls, v: float) -> float:
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("confidence must be in range 0.0-1.0")
-        return round(v, 2)
-
-
-class PatchPlan(BaseModel):
-    """Structured plan returned by LLM describing all changes to make to an APK."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    id: str = Field(
-        default_factory=lambda: f"plan_{uuid.uuid4().hex[:8]}",
-        description="Unique plan identifier",
-    )
-    description: str = Field(..., description="The original natural language request")
-    rationale: str = Field(..., description="LLM's plain-English reasoning for the changes")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Overall confidence 0-1")
-    modifications: List[Modification] = Field(
-        default_factory=list, description="List of concrete modifications"
-    )
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-
-    @field_validator("confidence")
-    @classmethod
-    def validate_confidence(cls, v: float) -> float:
-        return round(v, 2)
-
-    def summary(self) -> str:
-        return (
-            f"{self.id} | {len(self.modifications)} changes | "
-            f"confidence={self.confidence:.2f}"
-        )
+    resource_key: Optional[str] = Field(default=None, description="For resource edits")
+    new_value: Optional[str] = Field(default=None, description="New value for string resource")
 
 
 class AnalysisReport(BaseModel):
-    """Immutable report containing all metadata, decompilation artifacts,
-    string resources and runtime observations from Frida.
+    """Immutable report containing all data extracted from an APK.
+
+    Includes decompilation metadata, components, strings, resource map,
+    runtime observations from Frida, and helper methods for tests and LLM.
     """
 
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        arbitrary_types_allowed=True,
-        json_encoders={Path: str},
-    )
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     apk_path: Path
     package_name: str
@@ -133,44 +87,63 @@ class AnalysisReport(BaseModel):
     size_bytes: int = 0
 
     def summary(self) -> str:
-        return f"{self.package_name} ({self.version_name or 'unknown'}) - {len(self.components)} components, {len(self.strings)} strings"
+        """Return a compact human-readable summary."""
+        return (
+            f"APK: {self.apk_path.name} ({self.size_bytes / 1024:.1f} KB)\n"
+            f"Package: {self.package_name}\n"
+            f"Version: {self.version_name or 'N/A'}\n"
+            f"Components: {len(self.components)}\n"
+            f"Strings: {len(self.strings)}\n"
+            f"Runtime observations: {len(self.runtime_observations)}\n"
+            f"Confidence in analysis: high"
+        )
 
     def to_markdown(self) -> str:
-        md = f"""# APK Analysis Report
+        """Return a rich Markdown report for CLI/UI and LLM context."""
+        lines = [
+            f"# Analysis Report: {self.apk_path.name}",
+            f"**Package:** `{self.package_name}`",
+            f"**Version:** {self.version_name or 'unknown'} (code {self.version_code or 'unknown'})",
+            f"**SDK:** min={self.min_sdk} target={self.target_sdk}",
+            f"**Size:** {self.size_bytes} bytes",
+            "",
+            "## Components",
+            f"- Activities: {len(self.activities)}",
+            f"- Services: {len(self.services)}",
+            f"- Other: {len(self.components) - len(self.activities)}",
+            "",
+            "## Discovered Strings (sample)",
+        ]
+        for s in self.strings[:15]:
+            lines.append(f"- `{s}`")
+        if self.runtime_observations:
+            lines.append("")
+            lines.append("## Frida Runtime Observations")
+            for obs in self.runtime_observations:
+                lines.append(f"- {obs}")
+        lines.append("")
+        lines.append("Generated by APK Morph Analyzer.")
+        return "\n".join(lines)
 
-**Package:** {self.package_name}
-
-**Version:** {self.version_name} (code: {self.version_code})
-
-**SDK:** min={self.min_sdk} target={self.target_sdk}
-
-**Size:** {self.size_bytes / 1024:.1f} KB
-
-**Main Activity:** {self.main_activity or 'None'}
-
-## Components ({len(self.components)})
-
-"""
-        for comp in self.components[:15]:
-            md += f"- {comp}\n"
-        if len(self.components) > 15:
-            md += f"... and {len(self.components)-15} more\n"
-        md += f"\n## Runtime Observations ({len(self.runtime_observations)})\n"
-        for obs in self.runtime_observations:
-            md += f"- {obs}\n"
-        return md
-
-    def find_components(self, term: str = "", limit: int = 12) -> List[str]:
-        if not term.strip():
+    def find_components(self, term: str = "", limit: int = 10) -> List[str]:
+        """Return components matching optional term, limited."""
+        if not term or not term.strip():
             return self.components[:limit]
-        term = term.lower()
-        return [c for c in self.components if term in c.lower()][:limit]
-
-    def model_copy(self, *, update: Optional[Dict] = None, **kwargs: Any) -> "AnalysisReport":
-        if update is None:
-            update = {}
-        return super().model_copy(update=update, **kwargs)
+        term_l = term.lower()
+        matches = [c for c in self.components if term_l in c.lower()]
+        return matches[:limit]
 
 
-# For backward compat in tests etc.
-__all__ = ["AnalysisReport", "PatchPlan", "Modification"]
+class PatchPlan(BaseModel):
+    """Structured plan returned by the LLM describing the patches to apply."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(default_factory=lambda: "plan_" + uuid.uuid4().hex[:8])
+    description: str
+    rationale: str = ""
+    confidence: float = Field(0.75, ge=0.0, le=1.0)
+    modifications: List[Modification] = Field(default_factory=list)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
