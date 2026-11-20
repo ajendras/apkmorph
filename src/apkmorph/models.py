@@ -1,7 +1,8 @@
 """Pydantic models for APK Morph.
 
-Defines AnalysisReport (immutable analysis output), PatchPlan and Modification.
-All models are used by the analyzer, LLM, patch generator, CLI and UI.
+Defines immutable data structures for analysis reports, patch plans,
+and modifications. Supports string resources, runtime observations
+from Frida, XML/resource edits, and custom plugin edit types.
 """
 
 from datetime import datetime
@@ -12,41 +13,50 @@ from pydantic import BaseModel, Field
 
 
 class Modification(BaseModel):
-    """A single targeted edit (Smali, XML, resource or custom plugin)."""
+    """A single targeted modification (Smali, XML, resource, or plugin)."""
 
-    class_name: str = Field(..., description="Fully-qualified class or special value like 'resource'")
-    method: str = Field("", description="Method name/signature (empty for resource edits)")
-    edit_type: str = Field("smali", description="smali | xml | resource | <custom_plugin_type>")
-    description: str
-    confidence: float = Field(0.75, ge=0.0, le=1.0)
-    file_path: str = ""
-    diff: str = ""
-    location_hint: str = ""
-    original_snippet: str = ""
-    patched_snippet: str = ""
-    hover_explanation: str = ""
-    resource_key: Optional[str] = None
-    new_value: Optional[str] = None
-    params: Dict[str, Any] = Field(default_factory=dict)
+    edit_type: str = Field(
+        default="smali",
+        description="smali | xml | resource | custom plugin name",
+    )
+    class_name: str = Field(..., description="Class, resource key, or XML target")
+    method: str = Field(default="", description="Method or edit context")
+    description: str = Field(..., description="Plain-English rationale for this edit")
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    diff: str = Field(default="", description="Before/after diff (if applicable)")
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra parameters (e.g. string value, color for theme plugin)",
+    )
 
 
 class PatchPlan(BaseModel):
-    """LLM-generated plan containing one or more modifications.
-
-    Can be exported as JSON or embedded into a reusable Python script.
-    """
+    """LLM-generated plan containing one or more modifications."""
 
     id: str = Field(
-        default_factory=lambda: f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        default_factory=lambda: f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        description="Unique identifier",
     )
-    description: str
-    rationale: str = ""
-    confidence: float = Field(0.8, ge=0.0, le=1.0)
+    description: str = Field(..., description="Original natural-language request")
     modifications: List[Modification] = Field(default_factory=list)
+    rationale: str = Field(default="", description="LLM reasoning and explanations")
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+    def summary(self) -> str:
+        """Short summary for CLI/UI."""
+        return (
+            f"PatchPlan {self.id} — {len(self.modifications)} mods, "
+            f"confidence {self.confidence:.2f}"
+        )
 
 
 class AnalysisReport(BaseModel):
-    """Immutable report produced by APKAnalyzer.decompile() and observe_runtime()."""
+    """Full analysis of an APK (decompilation + Androguard + Frida observations).
+
+    Defaults are provided on all optional fields so tests can construct
+    minimal reports without triggering validation errors.
+    """
 
     apk_path: Path
     package_name: str
@@ -69,55 +79,16 @@ class AnalysisReport(BaseModel):
     runtime_observations: List[str] = Field(default_factory=list)
 
     def summary(self) -> str:
-        """Return a concise human-readable summary."""
+        """One-line summary used by CLI and UI."""
         return (
-            f"Package: {self.package_name}\n"
-            f"Version: {self.version_name or 'unknown'} (code {self.version_code or 'N/A'})\n"
-            f"Components: {len(self.components)} total, {len(self.activities)} activities\n"
-            f"Permissions: {len(self.permissions)}\n"
-            f"Strings: {len(self.strings)}\n"
-            f"Size: {self.size_bytes / 1024:.1f} KB\n"
-            f"Runtime observations: {len(self.runtime_observations)}\n"
-            f"Decompiled: {self.decompiled_dir}"
+            f"{self.package_name} v{self.version_name or '?.?'} "
+            f"({self.size_bytes} bytes, {len(self.components)} components, "
+            f"{len(self.runtime_observations)} observations)"
         )
 
-    def to_markdown(self) -> str:
-        """Markdown representation used in LLM prompts."""
-        md = f"# Analysis Report: {self.package_name}\n\n"
-        md += f"**Main activity:** {self.main_activity or 'None detected'}\n\n"
-        md += "## Components\n"
-        for category, items in [
-            ("Activities", self.activities),
-            ("Services", self.services),
-            ("Permissions", self.permissions),
-        ]:
-            md += f"### {category} ({len(items)})\n"
-            for item in items[:6]:
-                md += f"- {item}\n"
-            if len(items) > 6:
-                md += f"- ... and {len(items) - 6} more\n"
-            md += "\n"
-        if self.strings:
-            md += "## Sample Strings (trackers/ads)\n"
-            for s in self.strings[:12]:
-                md += f"- {s}\n"
-            md += "\n"
-        if self.runtime_observations:
-            md += "## Frida Runtime Observations\n"
-            for obs in self.runtime_observations[:10]:
-                md += f"- {obs}\n"
-        return md
-
-    def find_components(self, term: str = "", limit: int = 10) -> List[str]:
-        """Return components matching an optional term (used by prompt builder)."""
-        if not term.strip():
-            return self.components[:limit]
-        term_lower = term.lower()
-        return [c for c in self.components if term_lower in c.lower()][:limit]
-
-    def model_copy(self, update: Optional[Dict[str, Any]] = None) -> "AnalysisReport":
-        """Return a new copy with optional updates (Pydantic v2 compatible)."""
+    def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "AnalysisReport":
+        """Return a copy with optional updates (Pydantic v2 style)."""
         data = self.model_dump()
         if update:
             data.update(update)
-        return self.__class__.model_validate(data)
+        return AnalysisReport(**data)

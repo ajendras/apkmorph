@@ -1,280 +1,196 @@
-"""Patch generation and application module.
+"""Patch plan generation and application using local LLM.
 
-Uses LLMClient to turn natural language into PatchPlan, then applies edits
-via SmaliEditor (which supports plugins). Also provides batch, simulate,
-and the new export functionality for Python scripts and JSON templates.
+Uses enriched AnalysisReport (with Frida observations and string resources) to generate
+minimal patches. Supports simulation, batch processing, and export to reusable scripts.
 """
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from rich.console import Console
 
 from apkmorph.analyzer import APKAnalyzer
 from apkmorph.builder import APKBuilder
 from apkmorph.llm import LLMClient
-from apkmorph.models import AnalysisReport, Modification, PatchPlan
-from apkmorph.plugins import get_plugin_handler
+from apkmorph.models import AnalysisReport, PatchPlan, Modification
 from apkmorph.smali import SmaliEditor
+from apkmorph.plugins import list_custom_patch_types
+
+console = Console()
 
 
 class PatchGenerator:
-    """Generates intelligent patches from natural language using local LLM.
-
-    Validates plans, applies modifications (Smali, XML, resource, custom plugins),
-    supports batch processing, simulation, and now exporting plans as reusable
-    Python scripts (self-contained apply scripts) or JSON templates.
-    """
+    """Generates, validates, simulates, applies and exports patches."""
 
     def __init__(self, model: str = "llama3.2") -> None:
         self.model = model
         self.llm = LLMClient(model=model)
+        self.editor = SmaliEditor()
         self.builder = APKBuilder()
 
     def from_description(
-        self,
-        description: str,
-        report: AnalysisReport,
-        observe_runtime: bool = True,
+        self, description: str, report: AnalysisReport
     ) -> PatchPlan:
-        """Generate a PatchPlan from a natural-language description.
+        """Create a PatchPlan from a natural-language description.
 
-        If observe_runtime is True, enriches the report with Frida (or simulated)
-        observations first. Returns a validated PatchPlan.
+        Automatically enriches the report with runtime observations if missing.
         """
-        if not description or len(description.strip()) < 4:
-            raise ValueError("Description must be at least 4 characters")
+        console.print(f"[blue]Generating patch plan for: {description}[/blue]")
 
-        if observe_runtime:
+        if not report.runtime_observations:
             analyzer = APKAnalyzer()
             report = analyzer.observe_runtime(report)
 
-        plan = self.llm.generate_patch(description, report)
-        if not plan.id or plan.id.startswith("plan_") is False:
-            # ensure a stable id for export
-            plan.id = f"plan_{hash(description) % 1000000:06d}"
+        plan = self.llm.query(description, report)
+        plan.description = description
+        plan = self.validate(plan, report)
         return plan
 
-    def validate(self, plan: PatchPlan) -> bool:
-        """Basic validation of the plan (used before apply)."""
-        if not plan.modifications:
-            return False
+    def validate(self, plan: PatchPlan, report: AnalysisReport) -> PatchPlan:
+        """Sanity-check modifications against the report and adjust confidence."""
         for mod in plan.modifications:
-            if not mod.class_name or not mod.description:
-                return False
-            if mod.confidence < 0.0 or mod.confidence > 1.0:
-                return False
-            if mod.edit_type not in (
-                "smali",
-                "xml",
-                "resource",
-            ) and get_plugin_handler(mod.edit_type) is None:
-                # unknown type without a plugin is invalid
-                return False
-        return True
+            if (
+                mod.edit_type == "smali"
+                and mod.class_name not in report.components
+                and not any(mod.class_name in c for c in report.components)
+            ):
+                mod.confidence = max(0.1, mod.confidence * 0.6)
+                mod.description += " (target not found in APK)"
+            if mod.edit_type not in {"smali", "xml", "resource"} and mod.edit_type not in list_custom_patch_types():
+                mod.confidence = max(0.1, mod.confidence * 0.4)
 
-    def apply_plan(self, plan: PatchPlan, report: AnalysisReport) -> Path:
-        """Apply all modifications from the plan and rebuild/sign the APK.
+        if plan.modifications:
+            plan.confidence = sum(m.confidence for m in plan.modifications) / len(
+                plan.modifications
+            )
+        else:
+            plan.confidence = 0.3
+            plan.rationale += "\nWarning: no safe modifications identified."
 
-        Dispatches to SmaliEditor (for built-in types) or registered plugin handlers.
-        Returns path to the final signed APK.
-        """
-        if not self.validate(plan):
-            raise ValueError("Invalid PatchPlan - validation failed")
-
-        decompiled_dir = report.decompiled_dir
-        for mod in plan.modifications:
-            self._apply_modification(mod, decompiled_dir)
-
-        output_name = f"patched_{plan.id[:8]}.apk"
-        final_apk = self.builder.rebuild_and_sign(
-            str(decompiled_dir), output_name=output_name
-        )
-        return final_apk
-
-    def _apply_modification(self, mod: Modification, decompiled_dir: Path) -> bool:
-        """Apply a single modification using plugin or built-in editor."""
-        handler = get_plugin_handler(mod.edit_type)
-        if handler is not None:
-            return handler(mod, decompiled_dir)
-
-        editor = SmaliEditor(decompiled_dir)
-        return editor.apply_modification(mod)
+        return plan
 
     def simulate_apply(
         self, plan: PatchPlan, decompiled_dir: Path
     ) -> Dict[str, Any]:
-        """Dry-run the plan and return statistics without touching files."""
+        """Dry-run simulation returning what would be changed (no filesystem writes)."""
         applied = []
         for mod in plan.modifications:
             applied.append(
-                {
-                    "edit_type": mod.edit_type,
-                    "class_name": mod.class_name,
-                    "description": mod.description,
-                    "confidence": mod.confidence,
-                }
+                f"{mod.edit_type} on {mod.class_name}: {mod.description} (confidence {mod.confidence:.2f})"
             )
         return {
             "applied": applied,
-            "total": len(plan.modifications),
-            "success_rate": 0.92,
-            "simulated": True,
-            "decompiled_dir": str(decompiled_dir),
+            "success": True,
+            "would_modify": len(applied),
+            "rationale": plan.rationale,
         }
+
+    def apply_plan(self, plan: PatchPlan, report: AnalysisReport) -> Path:
+        """Apply every modification then rebuild+sign the APK."""
+        console.print("[blue]Applying modifications...[/blue]")
+        for mod in plan.modifications:
+            success = self.editor.apply_modification(mod, report.decompiled_dir)
+            if not success:
+                console.print(f"[yellow]Skipped {mod.edit_type} edit for {mod.class_name}[/yellow]")
+
+        output = self.builder.rebuild_and_sign(str(report.decompiled_dir))
+        console.print(f"[green]Successfully built signed APK: {output}[/green]")
+        return output
 
     def batch(
         self,
         description: str,
         apk_paths: List[str],
         output_dir: Path,
-        model: str | None = None,
+        model: str = "llama3.2",
         observe_runtime: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Apply the same natural-language description to many APKs.
-
-        Each APK is analyzed independently; the resulting plans are tailored.
-        """
-        output_dir = Path(output_dir)
+        """Process many APKs with the same natural-language request."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        analyzer = APKAnalyzer()
         results: List[Dict[str, Any]] = []
-        use_model = model or self.model
-
         for apk_str in apk_paths:
             try:
+                analyzer = APKAnalyzer()
                 report = analyzer.decompile(apk_str)
                 if observe_runtime:
                     report = analyzer.observe_runtime(report)
-                gen = PatchGenerator(model=use_model)
-                plan = gen.from_description(
-                    description, report, observe_runtime=False
-                )
-                final = gen.apply_plan(plan, report)
-                # move to output_dir if desired
-                target = output_dir / final.name
-                if final != target:
-                    final.rename(target)
-                    final = target
+                plan = self.from_description(description, report)
+                patched_path = self.apply_plan(plan, report)
+                final_path = output_dir / patched_path.name
+                if patched_path != final_path:
+                    if final_path.exists():
+                        final_path.unlink()
+                    patched_path.rename(final_path)
                 results.append(
                     {
                         "apk": apk_str,
                         "success": True,
                         "plan_id": plan.id,
-                        "output": str(final),
+                        "output": str(final_path),
                         "modifications": len(plan.modifications),
                     }
                 )
             except Exception as exc:
-                results.append(
-                    {"apk": apk_str, "success": False, "error": str(exc)}
-                )
+                results.append({"apk": apk_str, "success": False, "error": str(exc)})
         return results
 
     def export(
-        self,
-        plan: PatchPlan,
-        output_path: str | Path | None = None,
-        fmt: str = "python",
+        self, plan: PatchPlan, output: Optional[Path] = None, fmt: str = "python"
     ) -> Path:
-        """Export the patch plan as a reusable Python script or JSON template.
+        """Export plan as JSON template or a self-contained Python script.
 
-        - json:  Plain PatchPlan serialized to JSON (load with PatchPlan.model_validate)
-        - python: Self-contained runnable script that embeds the plan, decompiles
-                  a supplied APK, applies the exact modifications and rebuilds.
-                  The script works offline and can be committed to version control.
+        The Python script embeds the exact PatchPlan so it runs offline without
+        re-querying the LLM.
         """
-        if output_path is None:
-            suffix = ".json" if fmt.lower() == "json" else "_patch.py"
-            output_path = f"{plan.id}{suffix}"
+        if output is None:
+            ext = "json" if fmt.lower() == "json" else "py"
+            output = Path(f"{plan.id}.{ext}")
 
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        output.parent.mkdir(parents=True, exist_ok=True)
 
         if fmt.lower() == "json":
-            path = path.with_suffix(".json")
-            data = plan.model_dump(mode="json")
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            return path
+            output.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+            return output
 
-        if fmt.lower() == "python":
-            path = path.with_suffix(".py")
-            content = self._generate_python_script(plan)
-            path.write_text(content, encoding="utf-8")
-            # make executable on Unix
-            try:
-                path.chmod(0o755)
-            except OSError:
-                pass  # Windows or permission error
-            return path
-
-        raise ValueError("fmt must be 'python' or 'json'")
-
-    def _generate_python_script(self, plan: PatchPlan) -> str:
-        """Return full source of a standalone Python patch applicator."""
-        json_str = plan.model_dump_json(indent=2)
-        template = '''#!/usr/bin/env python3
+        # Python script with embedded plan (no LLM dependency)
+        plan_json = plan.model_dump_json(indent=4)
+        script = f'''"""
+Self-contained APK Morph patch exported from plan {plan.id}.
+Run: python {output.name} path/to/app.apk
 """
-Reusable APK Morph patch.
-Generated from plan: {plan_id}
-Description: {description}
-Rationale: {rationale}
-"""
-
-import json
-import sys
 from pathlib import Path
-from typing import Any
-
-from apkmorph.analyzer import APKAnalyzer
-from apkmorph.builder import APKBuilder
+import sys
 from apkmorph.models import PatchPlan
-from apkmorph.patch_generator import PatchGenerator
+from apkmorph.analyzer import APKAnalyzer
+from apkmorph.smali import SmaliEditor
+from apkmorph.builder import APKBuilder
 
 
-PLAN_JSON = """{json_data}"""
+PLAN_DATA = {plan_json}
 
 
-def load_plan() -> PatchPlan:
-    """Reconstruct PatchPlan from the embedded JSON."""
-    data = json.loads(PLAN_JSON)
-    return PatchPlan.model_validate(data)
-
-
-def main(argv: list[str] | None = None) -> None:
-    """Apply the embedded patch to the supplied APK."""
-    if argv is None:
-        argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
-        print(f"Usage: {{Path(sys.argv[0]).name}} <input_apk> [--output-dir DIR]")
-        print("Applies the saved modifications and produces a signed APK.")
-        sys.exit(0)
-
-    apk_path = argv[0]
-    out_dir = Path(argv[1] if len(argv) > 1 and not argv[1].startswith("-") else "patched")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Applying patch '{{load_plan().description}}' to {{apk_path}} ...")
-
-    analyzer = APKAnalyzer(working_dir=out_dir / "decompiled")
-    report = analyzer.decompile(apk_path)
-    # short simulation window (real Frida would require a device)
-    report = analyzer.observe_runtime(report, duration=3)
-
-    plan = load_plan()
-    generator = PatchGenerator()
-    final_apk = generator.apply_plan(plan, report)
-
-    print("\\n✅ Patch applied successfully!")
-    print(f"Output: {{final_apk.resolve()}}")
-    print(f"\\nRationale from original generation:\\n{{plan.rationale}}")
+def main(target: str | Path, output_dir: Path | None = None) -> Path:
+    plan = PatchPlan.model_validate(PLAN_DATA)
+    print("Applying exported plan:", plan.description)
+    analyzer = APKAnalyzer()
+    report = analyzer.decompile(str(target))
+    report = analyzer.observe_runtime(report)
+    editor = SmaliEditor()
+    for mod in plan.modifications:
+        editor.apply_modification(mod, report.decompiled_dir)
+    builder = APKBuilder()
+    if output_dir:
+        builder.build_dir = Path(output_dir)
+    signed = builder.rebuild_and_sign(str(report.decompiled_dir))
+    print("Signed APK created:", signed)
+    return signed
 
 
 if __name__ == "__main__":
-    main()
+    apk = sys.argv[1] if len(sys.argv) > 1 else "app.apk"
+    out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    main(apk, out_dir)
 '''
-        return template.format(
-            plan_id=plan.id,
-            description=plan.description,
-            rationale=plan.rationale or "No rationale provided.",
-            json_data=json_str,
-        )
+        output.write_text(script, encoding="utf-8")
+        return output
