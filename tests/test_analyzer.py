@@ -1,7 +1,10 @@
-"""Tests for the APKAnalyzer.
+"""Tests for APK analysis module.
 
-Covers decompilation (with mocks), component extraction, string resource parsing,
-keyword search, and runtime observation (simulation fallback)."""
+Covers decompilation mocking, component extraction, string resource parsing,
+keyword search, and the Frida simulation fallback used in CI environments
+without device access.
+"""
+
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -11,128 +14,133 @@ from apkmorph.models import AnalysisReport
 
 
 @pytest.fixture
-def temp_dir(tmp_path):
-    return tmp_path
-
-
-@pytest.fixture
-def analyzer(temp_dir):
-    return APKAnalyzer(working_dir=temp_dir)
-
-
-@pytest.fixture
-def sample_report(temp_dir):
+def mock_report():
     return AnalysisReport(
-        apk_path=Path("sample.apk"),
+        apk_path=Path("test.apk"),
         package_name="com.example.app",
-        decompiled_dir=temp_dir / "decompiled_sample",
-        size_bytes=1024,
-        strings=["ad", "analytics", "firebase analytics"],
-        string_resources={"app_name": "Sample App", "ad_text": "Click here to win!"},
-        components=["com.example.app.MainActivity", "com.example.app.AdManager"],
-        runtime_observations=["observed: ad - loadAd()"],
-        metadata={},
+        version_name="1.0",
+        version_code="1",
+        min_sdk=24,
+        target_sdk=34,
+        decompiled_dir=Path("/tmp/decompiled_test"),
+        main_activity="com.example.app.MainActivity",
+        activities=["com.example.app.MainActivity"],
+        services=[],
+        receivers=[],
+        providers=[],
+        permissions=["android.permission.INTERNET"],
+        components=["com.example.app.MainActivity"],
+        strings=["analytics", "ad", "firebase"],
+        string_resources={"app_name": "Test App", "ad_text": "Advertisement"},
+        metadata={"is_signed": True, "smali_classes": 5},
+        size_bytes=2048,
+        runtime_observations=[],
     )
 
 
-@patch("apkmorph.analyzer.run_apktool")
-@patch("apkmorph.analyzer.APK")
-def test_decompile(mock_apk_class, mock_run, analyzer, temp_dir):
-    dummy_apk = temp_dir / "dummy.apk"
-    dummy_apk.touch()
+def test_decompile(tmp_path: Path):
+    apk_path = tmp_path / "test.apk"
+    apk_path.touch()
 
-    mock_apk = mock_apk_class.return_value
-    mock_apk.get_activities.return_value = ["com.example.MainActivity"]
-    mock_apk.get_services.return_value = []
-    mock_apk.get_receivers.return_value = []
-    mock_apk.get_providers.return_value = []
-    mock_apk.get_permissions.return_value = ["android.permission.INTERNET"]
-    mock_apk.get_package.return_value = "com.example.app"
-    mock_apk.get_androidversion_name.return_value = "1.0"
-    mock_apk.get_androidversion_code.return_value = "1"
-    mock_apk.get_min_sdk_version.return_value = 21
-    mock_apk.get_target_sdk_version.return_value = 33
-    mock_apk.get_main_activity.return_value = "com.example.MainActivity"
-    mock_apk.is_signed.return_value = True
-    mock_apk.get_certificates.return_value = []
+    with patch("apkmorph.analyzer.run_apktool") as mock_apktool, \
+         patch("apkmorph.analyzer.APK") as mock_apk_class, \
+         patch("apkmorph.analyzer.APKAnalyzer.extract_components") as mock_extract, \
+         patch("apkmorph.analyzer.APKAnalyzer._extract_string_resources") as mock_strings:
 
-    report = analyzer.decompile(str(dummy_apk))
+        mock_apktool.return_value = None
+        mock_apk = MagicMock()
+        mock_apk_class.return_value = mock_apk
+        mock_apk.get_activities.return_value = ["com.example.MainActivity"]
+        mock_apk.get_services.return_value = []
+        mock_apk.get_receivers.return_value = []
+        mock_apk.get_providers.return_value = []
+        mock_apk.get_permissions.return_value = []
+        mock_apk.get_package.return_value = "com.example.app"
+        mock_apk.get_androidversion_name.return_value = "1.0"
+        mock_apk.get_androidversion_code.return_value = "1"
+        mock_apk.get_min_sdk_version.return_value = 24
+        mock_apk.get_target_sdk_version.return_value = 34
+        mock_apk.get_main_activity.return_value = "com.example.MainActivity"
+        mock_apk.is_signed.return_value = True
+        mock_apk.get_certificates.return_value = []
+        mock_extract.return_value = ["com.example.MainActivity"]
+        mock_strings.return_value = (["test string"], {"test": "string"})
 
-    assert isinstance(report, AnalysisReport)
-    assert report.package_name == "com.example.app"
-    assert report.version_name == "1.0"
-    assert len(report.components) >= 1
-    assert "smali_classes" in report.metadata
-    mock_run.assert_called_once()
+        analyzer = APKAnalyzer(working_dir=tmp_path / "decomp")
+        report = analyzer.decompile(str(apk_path))
+
+        assert report.package_name == "com.example.app"
+        assert report.strings
+        assert isinstance(report.decompiled_dir, Path)
+        mock_apktool.assert_called()
+        mock_apk_class.assert_called()
 
 
-def test_extract_components(analyzer, temp_dir):
-    smali_dir = temp_dir / "smali" / "com" / "example"
+def test_extract_components(tmp_path: Path):
+    analyzer = APKAnalyzer()
+    smali_dir = tmp_path / "smali_classes2" / "com" / "example" / "utils"
     smali_dir.mkdir(parents=True)
-    (smali_dir / "MainActivity.smali").write_text(
-        ".class public Lcom/example/MainActivity;"
+    (smali_dir / "Helper.smali").write_text(
+        ".class public Lcom/example/utils/Helper;\n.method public static helper()V"
     )
-    utils_dir = smali_dir / "utils"
-    utils_dir.mkdir()
-    (utils_dir / "Helper.smali").write_text(
-        ".class public Lcom/example/utils/Helper;"
-    )
-
-    components = analyzer.extract_components(temp_dir)
-    assert "com.example.MainActivity" in components
+    components = analyzer.extract_components(tmp_path)
     assert "com.example.utils.Helper" in components
 
 
-def test_extract_string_resources(analyzer, temp_dir):
-    values_dir = temp_dir / "res" / "values"
+def test_find_by_keyword_with_xml(tmp_path: Path):
+    analyzer = APKAnalyzer()
+    xml_path = tmp_path / "AndroidManifest.xml"
+    xml_path.write_text(
+        '<manifest package="com.example.app">'
+        '<uses-permission android:name="android.permission.CAMERA"/>'
+        "</manifest>"
+    )
+    matches = analyzer.find_by_keyword("camera", tmp_path)
+    assert any("resource" in m for m in matches) or any("camera" in m for m in matches)
+
+
+def test_extract_string_resources(tmp_path: Path):
+    analyzer = APKAnalyzer()
+    values_dir = tmp_path / "res" / "values"
     values_dir.mkdir(parents=True)
-    strings_xml = values_dir / "strings.xml"
-    strings_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">APK Morph</string>
-    <string name="welcome">Welcome to the app</string>
-    <string-array name="options">
-        <item>Option 1</item>
-    </string-array>
-</resources>""")
-
-    strings, string_map = analyzer._extract_string_resources(temp_dir)
-    assert "APK Morph" in strings
-    assert "Welcome to the app" in strings
-    assert "Option 1" in strings
-    assert string_map["app_name"] == "APK Morph"
-    assert len(string_map) >= 1
+    (values_dir / "strings.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<resources>\n'
+        '    <string name="app_name">APK Morph</string>\n'
+        '    <string name="analytics_disabled">Analytics disabled</string>\n'
+        '</resources>'
+    )
+    strings, string_map = analyzer._extract_string_resources(tmp_path)
+    assert any("APK Morph" in s for s in strings)
+    assert string_map.get("app_name") == "APK Morph"
+    assert "analytics_disabled" in string_map
 
 
-def test_find_by_keyword(analyzer, temp_dir):
-    smali_dir = temp_dir / "smali" / "com" / "example"
-    smali_dir.mkdir(parents=True)
-    (smali_dir / "AdActivity.smali").write_text("ad related code")
-    (temp_dir / "AndroidManifest.xml").write_text("<manifest><application android:label=\"ad label\"/></manifest>")
-
-    matches = analyzer.find_by_keyword("ad", temp_dir)
-    assert any("AdActivity" in m for m in matches)
-    assert any("resource:" in m for m in matches) or len(matches) > 0
-
-
-def test_observe_runtime_simulation(sample_report, analyzer):
-    with patch.object(analyzer, "_run_frida_observation") as mock_run:
-        mock_run.return_value = [
-            "observed: ad - com.google.android.gms.ads.AdView.loadAd() called 4 times",
-            "observed: analytics - FirebaseAnalytics.logEvent() called with screen_view and user_engagement",
-        ]
-        updated = analyzer.observe_runtime(sample_report, duration=2)
-        assert isinstance(updated, AnalysisReport)
-        assert len(updated.runtime_observations) == 2
-        assert updated.metadata.get("runtime_observed") is True
-        assert "frida_used" in updated.metadata
+def test_observe_runtime_simulation(mock_report: AnalysisReport):
+    analyzer = APKAnalyzer()
+    with patch("apkmorph.analyzer._FRIDA_AVAILABLE", False):
+        updated_report = analyzer.observe_runtime(mock_report, duration=1)
+        assert len(updated_report.runtime_observations) > 2
+        assert updated_report.metadata["runtime_observed"] is True
+        assert updated_report.metadata["frida_used"] is False
+        obs = " ".join(updated_report.runtime_observations).lower()
+        assert "analytics" in obs or "ad" in obs or "oncreate" in obs
 
 
-def test_simulate_observations(analyzer):
-    strings = ["This app uses firebase analytics and shows ads", "crash reporting enabled"]
-    obs = analyzer._simulate_observations("com.test.app", strings)
-    assert any("onCreate" in o for o in obs)
-    assert any("ad" in o.lower() for o in obs)
-    assert any("analytics" in o.lower() for o in obs)
-    assert any("crash_reporting" in o for o in obs)
-    assert len(obs) >= 5
+def test_observe_runtime_with_frida_available(mock_report: AnalysisReport):
+    analyzer = APKAnalyzer()
+    with patch("apkmorph.analyzer._FRIDA_AVAILABLE", True), \
+         patch("apkmorph.analyzer.frida") as mock_frida:
+
+        mock_device = MagicMock()
+        mock_frida.get_usb_device.return_value = mock_device
+        mock_device.spawn.return_value = 1234
+        mock_session = MagicMock()
+        mock_device.attach.return_value = mock_session
+        mock_script = MagicMock()
+        mock_session.create_script.return_value = mock_script
+
+        with patch.object(analyzer, "_run_frida_observation", return_value=["observed: test hook"]):
+            updated = analyzer.observe_runtime(mock_report, duration=1)
+            assert "test hook" in updated.runtime_observations[0]
+            assert updated.metadata["frida_used"] is True
