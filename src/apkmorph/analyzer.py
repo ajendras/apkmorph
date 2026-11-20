@@ -87,7 +87,10 @@ class APKAnalyzer:
                 ["d", str(path), "-o", str(decompiled_dir), "-f", "--no-src"]
             )
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"Apktool decompilation failed: {exc.stderr}") from exc
+            stderr = getattr(exc, "stderr", b"")
+            if isinstance(stderr, (bytes, bytearray)):
+                stderr = stderr.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Apktool decompilation failed: {stderr}") from exc
         except FileNotFoundError as exc:
             raise FileNotFoundError(
                 "Apktool not found. Please install Apktool and ensure it is on PATH."

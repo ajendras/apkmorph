@@ -1,105 +1,69 @@
-"""Pydantic models for APK Morph.
+"""Data models for APK Morph.
 
-Defines the core data structures used across analysis, patch generation,
-and UI components. All models are immutable by default and include
-helpful validation and helper methods. Extended with runtime_observations
-captured by Frida and support for custom plugin patch types.
+Uses Pydantic v2 for validation, defaults and immutability where appropriate.
+Supports all features including runtime observations, resource edits and plugin params.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
-import uuid
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class Modification(BaseModel):
-    """A single, auditable modification to be applied to decompiled Smali, XML or resources."""
+    """Represents one atomic modification suggested by the LLM.
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    Used for Smali edits, XML changes, resource string updates and custom plugin
+    modifications. The fields original_snippet/patched_snippet/hover_explanation
+    power the side-by-side diff viewer.
+    """
 
-    id: str = Field(
-        default_factory=lambda: uuid.uuid4().hex[:12],
-        description="Unique identifier for this modification step",
-    )
-    class_name: str = Field(..., description="Fully-qualified Java class name (empty for resources)")
-    method: str = Field(..., description="Method name/signature or resource identifier")
-    diff: str = Field(
-        ...,
-        description="Human-readable description of the inserted/removed instructions or string change",
-    )
-    description: str = Field(
-        default="",
-        description="Plain-English explanation of why this change is needed",
-    )
-    edit_type: Literal["smali", "xml", "resource"] | str = Field(
-        default="smali",
-        description="Type of edit: smali, xml, resource or any registered custom plugin name",
-    )
-    file_path: Optional[Path] = Field(
-        None,
-        description="Relative path to the file to edit inside the decompiled directory",
-    )
-    location_hint: Optional[str] = Field(
-        None, description="Line number, method offset or XPath for the edit"
-    )
-    original_snippet: Optional[str] = Field(
-        None, description="Original code/XML snippet for the interactive diff viewer"
-    )
-    patched_snippet: Optional[str] = Field(
-        None, description="Patched version for the interactive diff viewer"
-    )
-    hover_explanation: Optional[str] = Field(
-        None, description="Tooltip text explaining the change for the UI"
-    )
-    resource_key: Optional[str] = Field(
-        None, description="Resource key for string/resource edits"
-    )
-    new_value: Optional[str] = Field(
-        None, description="New value for resource/string edits"
-    )
-    params: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Additional parameters for custom plugin-based patch types (e.g. colors for a theme injector)",
-    )
-    confidence: float = Field(
-        default=0.8,
-        ge=0.0,
-        le=1.0,
-        description="Confidence that this modification achieves the requested outcome",
-    )
+    class_name: str
+    method: str
+    edit_type: str = "smali"
+    diff: str = ""
+    description: str = Field(..., description="Human readable explanation of the change")
+    confidence: float = Field(0.75, ge=0.0, le=1.0)
+    file_path: str = ""
+    location_hint: Optional[str] = None
+    original_snippet: str = ""
+    patched_snippet: str = ""
+    hover_explanation: str = ""
+    # For resource edits
+    resource_key: Optional[str] = None
+    new_value: Optional[str] = None
+    # For custom plugin types
+    params: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PatchPlan(BaseModel):
-    """Structured plan returned by the LLM describing all changes to make."""
+    """Structured output from the LLM describing the patch to apply.
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    Persisted to disk for the apply/explain CLI commands.
+    """
 
     id: str = Field(
-        default_factory=lambda: f"plan_{uuid.uuid4().hex[:8]}",
-        description="Unique identifier for this patch plan",
+        default_factory=lambda: f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
-    description: str = Field(..., description="Original natural-language request")
-    rationale: str = Field(..., description="Plain-English explanation of the overall strategy")
-    confidence: float = Field(
-        ..., ge=0.0, le=1.0, description="Overall confidence in the plan (0.0-1.0)"
-    )
-    modifications: List[Modification] = Field(
-        default_factory=list, description="Ordered list of concrete modifications"
-    )
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
-        description="When the plan was generated",
-    )
+    description: str
+    rationale: str = "No rationale provided by model."
+    confidence: float = Field(0.8, ge=0.0, le=1.0)
+    modifications: List[Modification] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+    model_config = ConfigDict(frozen=True)
+
+    def summary(self) -> str:
+        n = len(self.modifications)
+        return f"{self.id} - {self.description} ({n} mods, conf={self.confidence:.2f})"
 
 
 class AnalysisReport(BaseModel):
-    """Immutable report containing everything the LLM and editors need."""
+    """Full analysis result from decompilation, Androguard and optional Frida observation.
 
-    model_config = ConfigDict(
-        extra="forbid", frozen=True, arbitrary_types_allowed=True
-    )
+    Immutable. Used as context for the LLM and for applying patches.
+    """
 
     apk_path: Path
     package_name: str
@@ -119,45 +83,33 @@ class AnalysisReport(BaseModel):
     string_resources: Dict[str, str] = Field(default_factory=dict)
     runtime_observations: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    size_bytes: int
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    size_bytes: int = 0
+
+    model_config = ConfigDict(frozen=True)
 
     def summary(self) -> str:
-        """Short human-readable summary used by the CLI."""
         return (
-            f"Package: {self.package_name}\n"
-            f"Version: {self.version_name or 'unknown'} (SDK {self.min_sdk}-{self.target_sdk})\n"
-            f"Components: {len(self.components)} | Strings: {len(self.strings)}\n"
-            f"Runtime observations: {len(self.runtime_observations)} | Size: {self.size_bytes >> 10} KiB"
+            f"{self.package_name} v{self.version_name or '?'} "
+            f"({len(self.components)} components, {len(self.strings)} strings)"
         )
 
     def to_markdown(self) -> str:
-        """Rich Markdown version used in LLM prompts."""
-        comp_sample = "\n".join(f"- {c}" for c in self.components[:8])
-        obs_sample = "\n".join(f"- {o}" for o in self.runtime_observations[:8])
-        return f"""# Analysis of {self.apk_path.name}
+        lines = [
+            f"# APK Analysis: {self.apk_path.name}",
+            f"**Package:** {self.package_name}",
+            f"**Version:** {self.version_name or 'N/A'} (SDK {self.min_sdk}-{self.target_sdk})",
+            f"**Components:** {len(self.components)}",
+            f"**Strings:** {len(self.strings)} (resources: {len(self.string_resources)})",
+            "\n## Runtime Observations",
+        ]
+        lines.extend(self.runtime_observations or ["(no observations)"])
+        lines.append("\n## Key Strings")
+        for s in self.strings[:10]:
+            lines.append(f"- {s}")
+        return "\n".join(lines)
 
-**Package:** {self.package_name}
-**Version:** {self.version_name or 'N/A'} (code {self.version_code or 'N/A'})
-**SDK:** min {self.min_sdk} / target {self.target_sdk}
-**Main activity:** {self.main_activity or 'unknown'}
-**Size:** {self.size_bytes >> 10} KiB
-
-## Components (sample)
-{comp_sample}
-
-## Runtime observations (Frida)
-{obs_sample or 'None recorded.'}
-
-## Extracted strings (sample)
-{chr(10).join('- ' + s for s in self.strings[:10])}
-"""
-
-    def find_components(self, keyword: str = "", limit: int = 12) -> List[str]:
-        """Helper used by LLM prompt construction."""
-        if not keyword or not keyword.strip():
+    def find_components(self, term: str = "", limit: int = 12) -> List[str]:
+        if not term:
             return self.components[:limit]
-        k = keyword.lower().strip()
-        return [c for c in self.components if k in c.lower()][:limit]
+        term_l = term.lower()
+        return [c for c in self.components if term_l in c.lower()][:limit]
