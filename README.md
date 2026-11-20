@@ -29,6 +29,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 - One-click rebuild, zipalign, and signing (debug or custom keystore) produces a ready-to-install APK
 - Supports popular local models (Gemma 2, Phi 3, Code Llama) with automatic download on first use
 - Extensible plugin API lets you register custom patch types (e.g. theme injectors, permission managers)
+- Export any patch as a reusable Python script or JSON template for versioning, sharing, or CI
 
 ## 🎬 Demo
 
@@ -85,6 +86,9 @@ apkmorph apply
 
 # 4. Batch-apply the same natural-language patch to many APKs
 apkmorph batch "disable all analytics and remove ads" *.apk --output-dir ./patched_batch --model phi3
+
+# 5. Export the plan for reuse (Python script or JSON template)
+apkmorph export plan_abc123 --format python --output remove_ads_patch.py
 ```
 
 The resulting `patched_*.apk` is ready to install. All commands are defined in `src/apkmorph/cli.py`.
@@ -98,7 +102,27 @@ apkmorph analyze myapp.apk
 apkmorph patch "remove splash screen, disable crash reporting and empty ad strings" myapp.apk --model phi3 --apply
 apkmorph explain plan_abc123
 apkmorph batch "disable analytics and remove ads" app1.apk app2.apk --output-dir ./patched --no-observe
+apkmorph export plan_abc123 --format python
 ```
+
+**Exporting patches for reuse**
+
+Any generated `PatchPlan` can be exported as a self-contained Python script or a JSON template. The Python script embeds the exact modifications so it can be run later (or shared) without re-querying the LLM and works on similar APKs.
+
+```bash
+apkmorph export plan_7f3a9c --format python --output mypatch.py
+apkmorph export plan_7f3a9c --format json --output template.json
+```
+
+Run the exported script:
+
+```bash
+python mypatch.py path/to/app.apk
+# or
+python mypatch.py path/to/app.apk --output-dir ./patched
+```
+
+The script decompiles the target, applies the saved modifications (Smali/XML/resources/plugins), rebuilds and signs the APK.
 
 **Launch the Streamlit dashboard**
 
@@ -114,16 +138,21 @@ The UI (located in `src/apkmorph/ui/app.py`) provides file upload, a chat-style 
 from apkmorph.analyzer import APKAnalyzer
 from apkmorph.patch_generator import PatchGenerator
 from apkmorph.builder import APKBuilder
+from pathlib import Path
 
 analyzer = APKAnalyzer()
 report = analyzer.decompile("game.apk")
-report = analyzer.observe_runtime(report)  # observes live method calls via Frida
+report = analyzer.observe_runtime(report)
 
-generator = PatchGenerator(model="gemma2")  # or phi3, codellama — auto-downloaded
+generator = PatchGenerator(model="gemma2")
 plan = generator.from_description("remove all ads and update app name", report)
 
 print(plan.rationale)
 print(f"Confidence: {plan.confidence:.2f}")
+
+# Export for reuse / versioning
+generator.export(plan, "remove_ads_patch.py", fmt="python")
+generator.export(plan, "remove_ads_template.json", fmt="json")
 
 builder = APKBuilder()
 final_apk = builder.rebuild_and_sign(str(report.decompiled_dir))
@@ -280,7 +309,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Support additional local models (Gemma2, Phi3, CodeLlama) with auto-download
 - [x] Implement batch mode for applying the same natural-language patch to many APKs
 - [x] Create simple plugin API so users can register custom patch types (e.g. theme injectors)
-- [ ] Add export of generated patches as reusable Python scripts or JSON templates
+- [x] Add export of generated patches as reusable Python scripts or JSON templates
 - [ ] Enable direct push to connected Android device with install + launch
 - [ ] Improve error recovery with automatic rollback on rebuild failure
 - [ ] Add confidence scoring UI element and user feedback loop to refine LLM prompts

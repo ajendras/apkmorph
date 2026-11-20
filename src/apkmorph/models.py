@@ -1,69 +1,52 @@
-"""Data models for APK Morph.
+"""Pydantic models for APK Morph.
 
-Uses Pydantic v2 for validation, defaults and immutability where appropriate.
-Supports all features including runtime observations, resource edits and plugin params.
+Defines AnalysisReport (immutable analysis output), PatchPlan and Modification.
+All models are used by the analyzer, LLM, patch generator, CLI and UI.
 """
 
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class Modification(BaseModel):
-    """Represents one atomic modification suggested by the LLM.
+    """A single targeted edit (Smali, XML, resource or custom plugin)."""
 
-    Used for Smali edits, XML changes, resource string updates and custom plugin
-    modifications. The fields original_snippet/patched_snippet/hover_explanation
-    power the side-by-side diff viewer.
-    """
-
-    class_name: str
-    method: str
-    edit_type: str = "smali"
-    diff: str = ""
-    description: str = Field(..., description="Human readable explanation of the change")
+    class_name: str = Field(..., description="Fully-qualified class or special value like 'resource'")
+    method: str = Field("", description="Method name/signature (empty for resource edits)")
+    edit_type: str = Field("smali", description="smali | xml | resource | <custom_plugin_type>")
+    description: str
     confidence: float = Field(0.75, ge=0.0, le=1.0)
     file_path: str = ""
-    location_hint: Optional[str] = None
+    diff: str = ""
+    location_hint: str = ""
     original_snippet: str = ""
     patched_snippet: str = ""
     hover_explanation: str = ""
-    # For resource edits
     resource_key: Optional[str] = None
     new_value: Optional[str] = None
-    # For custom plugin types
     params: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PatchPlan(BaseModel):
-    """Structured output from the LLM describing the patch to apply.
+    """LLM-generated plan containing one or more modifications.
 
-    Persisted to disk for the apply/explain CLI commands.
+    Can be exported as JSON or embedded into a reusable Python script.
     """
 
     id: str = Field(
         default_factory=lambda: f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     description: str
-    rationale: str = "No rationale provided by model."
+    rationale: str = ""
     confidence: float = Field(0.8, ge=0.0, le=1.0)
     modifications: List[Modification] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.now)
-
-    model_config = ConfigDict(frozen=True)
-
-    def summary(self) -> str:
-        n = len(self.modifications)
-        return f"{self.id} - {self.description} ({n} mods, conf={self.confidence:.2f})"
 
 
 class AnalysisReport(BaseModel):
-    """Full analysis result from decompilation, Androguard and optional Frida observation.
-
-    Immutable. Used as context for the LLM and for applying patches.
-    """
+    """Immutable report produced by APKAnalyzer.decompile() and observe_runtime()."""
 
     apk_path: Path
     package_name: str
@@ -81,35 +64,60 @@ class AnalysisReport(BaseModel):
     components: List[str] = Field(default_factory=list)
     strings: List[str] = Field(default_factory=list)
     string_resources: Dict[str, str] = Field(default_factory=dict)
-    runtime_observations: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     size_bytes: int = 0
-
-    model_config = ConfigDict(frozen=True)
+    runtime_observations: List[str] = Field(default_factory=list)
 
     def summary(self) -> str:
+        """Return a concise human-readable summary."""
         return (
-            f"{self.package_name} v{self.version_name or '?'} "
-            f"({len(self.components)} components, {len(self.strings)} strings)"
+            f"Package: {self.package_name}\n"
+            f"Version: {self.version_name or 'unknown'} (code {self.version_code or 'N/A'})\n"
+            f"Components: {len(self.components)} total, {len(self.activities)} activities\n"
+            f"Permissions: {len(self.permissions)}\n"
+            f"Strings: {len(self.strings)}\n"
+            f"Size: {self.size_bytes / 1024:.1f} KB\n"
+            f"Runtime observations: {len(self.runtime_observations)}\n"
+            f"Decompiled: {self.decompiled_dir}"
         )
 
     def to_markdown(self) -> str:
-        lines = [
-            f"# APK Analysis: {self.apk_path.name}",
-            f"**Package:** {self.package_name}",
-            f"**Version:** {self.version_name or 'N/A'} (SDK {self.min_sdk}-{self.target_sdk})",
-            f"**Components:** {len(self.components)}",
-            f"**Strings:** {len(self.strings)} (resources: {len(self.string_resources)})",
-            "\n## Runtime Observations",
-        ]
-        lines.extend(self.runtime_observations or ["(no observations)"])
-        lines.append("\n## Key Strings")
-        for s in self.strings[:10]:
-            lines.append(f"- {s}")
-        return "\n".join(lines)
+        """Markdown representation used in LLM prompts."""
+        md = f"# Analysis Report: {self.package_name}\n\n"
+        md += f"**Main activity:** {self.main_activity or 'None detected'}\n\n"
+        md += "## Components\n"
+        for category, items in [
+            ("Activities", self.activities),
+            ("Services", self.services),
+            ("Permissions", self.permissions),
+        ]:
+            md += f"### {category} ({len(items)})\n"
+            for item in items[:6]:
+                md += f"- {item}\n"
+            if len(items) > 6:
+                md += f"- ... and {len(items) - 6} more\n"
+            md += "\n"
+        if self.strings:
+            md += "## Sample Strings (trackers/ads)\n"
+            for s in self.strings[:12]:
+                md += f"- {s}\n"
+            md += "\n"
+        if self.runtime_observations:
+            md += "## Frida Runtime Observations\n"
+            for obs in self.runtime_observations[:10]:
+                md += f"- {obs}\n"
+        return md
 
-    def find_components(self, term: str = "", limit: int = 12) -> List[str]:
-        if not term:
+    def find_components(self, term: str = "", limit: int = 10) -> List[str]:
+        """Return components matching an optional term (used by prompt builder)."""
+        if not term.strip():
             return self.components[:limit]
-        term_l = term.lower()
-        return [c for c in self.components if term_l in c.lower()][:limit]
+        term_lower = term.lower()
+        return [c for c in self.components if term_lower in c.lower()][:limit]
+
+    def model_copy(self, update: Optional[Dict[str, Any]] = None) -> "AnalysisReport":
+        """Return a new copy with optional updates (Pydantic v2 compatible)."""
+        data = self.model_dump()
+        if update:
+            data.update(update)
+        return self.__class__.model_validate(data)

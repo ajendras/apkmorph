@@ -362,6 +362,53 @@ def batch(
 
 
 @app.command()
+def export(
+    plan_id: str = typer.Argument(..., help="ID (or prefix) of the saved plan to export"),
+    fmt: str = typer.Option(
+        "python",
+        "--format",
+        "-f",
+        help="Export format: python (standalone script) or json (template)",
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Output file path (default: <plan_id>.py or .json)"
+    ),
+) -> None:
+    """Export a generated PatchPlan as a reusable Python script or JSON template.
+
+    The Python script is self-contained, embeds the exact modifications, and can be
+    executed on other APKs without re-running the LLM. JSON is useful for templates
+    or version control.
+    """
+    plan = _load_latest_plan()
+    if plan is None or not plan.id.startswith(plan_id):
+        console.print("[red]No matching patch plan found.[/red]")
+        console.print("Run 'apkmorph patch ...' first.")
+        raise typer.Exit(1)
+
+    console.print(f"Exporting plan [bold cyan]{plan.id}[/bold cyan] as {fmt}...")
+
+    try:
+        generator = PatchGenerator()
+        out_path = generator.export(plan, output, fmt=fmt)
+        console.print(f"[green]✓ Successfully exported to[/green] [bold]{out_path}[/bold]")
+
+        if fmt.lower() == "python":
+            console.print(
+                Panel(
+                    "Run with: [bold]python "
+                    f"{out_path.name} your_app.apk[/bold]\n\n"
+                    "The script works offline and can be committed to git.",
+                    title="Next steps",
+                    border_style="green",
+                )
+            )
+    except Exception as exc:
+        console.print(f"[red]Export failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+@app.command()
 def ui(
     port: int = typer.Option(8501, "--port", help="Port on which to run the Streamlit server"),
     debug: bool = typer.Option(False, "--debug", help="Run Streamlit in debug mode"),
