@@ -95,7 +95,7 @@ def analyze(
         analyzer = APKAnalyzer()
         report: AnalysisReport = analyzer.decompile(str(apk_path.resolve()))
 
-        console.print("[green]✓[/green] Decompilation and analysis completed")
+        console.print("[green]✓ Decompilation and analysis completed")
 
         summary_panel = Panel(
             report.summary(),
@@ -164,11 +164,23 @@ def patch(
         "--apply",
         help="Immediately apply the generated plan",
     ),
+    install: bool = typer.Option(
+        False,
+        "--install",
+        "-i",
+        help="Push installed APK to connected device via ADB",
+    ),
+    launch: bool = typer.Option(
+        True,
+        "--launch/--no-launch",
+        help="Launch the app after install (requires --install)",
+    ),
 ) -> None:
     """Translate a plain-English request into a precise PatchPlan using a local LLM.
 
     The plan contains minimal Smali/XML edits with confidence scores and rationale.
     Gemma 2, Phi 3 and Code Llama are supported with automatic download.
+    Optionally installs and launches on a connected Android device.
     """
     console.print(
         f'Generating intelligent patch for request: "[italic]{description}[/italic]"'
@@ -214,7 +226,7 @@ def patch(
         console.print(f"\n[bold green]Patch plan {plan.id} saved.[/bold green]")
 
         if apply_now:
-            _apply_plan(plan, apk_path, report=report)
+            _apply_plan(plan, apk_path, report=report, install=install, launch=launch)
 
     except ValidationError as exc:
         console.print("[red]LLM produced an invalid PatchPlan.[/red]")
@@ -226,7 +238,11 @@ def patch(
 
 
 def _apply_plan(
-    plan: PatchPlan, original_apk: Optional[Path] = None, report: Optional[AnalysisReport] = None
+    plan: PatchPlan,
+    original_apk: Optional[Path] = None,
+    report: Optional[AnalysisReport] = None,
+    install: bool = False,
+    launch: bool = True,
 ) -> None:
     """Apply all modifications from a PatchPlan and rebuild the APK.
 
@@ -243,7 +259,7 @@ def _apply_plan(
             console.print("[yellow]No decompiled report available, skipping edit phase.[/yellow]")
             return
 
-        output_apk = generator.apply_plan(plan, report)
+        output_apk = generator.apply_plan(plan, report, install=install, launch=launch)
 
         console.print(
             Panel(
@@ -265,8 +281,19 @@ def apply(
         "-p",
         help="Patch plan ID (uses latest if omitted)",
     ),
+    apk_path: Optional[Path] = typer.Option(
+        None,
+        "--apk",
+        help="Original APK (needed if install is used and decompile dir is gone)",
+    ),
+    install: bool = typer.Option(False, "--install", "-i", help="Install on device"),
+    launch: bool = typer.Option(True, "--launch/--no-launch", help="Auto launch"),
 ) -> None:
-    """Apply the latest (or a specific) patch plan and produce a signed APK."""
+    """Apply the latest (or a specific) patch plan and produce a signed APK.
+
+    Use --install to push the rebuilt APK to a connected Android device
+    and --launch to start the main activity automatically.
+    """
     plan = _load_latest_plan()
     if plan is None:
         console.print("[yellow]No patch plan found. Generate one with the patch command first.[/yellow]")
@@ -277,7 +304,7 @@ def apply(
         raise typer.Exit(1)
 
     console.print(f"Applying plan [bold cyan]{plan.id}[/bold cyan]")
-    _apply_plan(plan)
+    _apply_plan(plan, apk_path, None, install=install, launch=launch)
 
 
 @app.command()
@@ -331,6 +358,16 @@ def batch(
         "--no-observe",
         help="Skip Frida runtime observation",
     ),
+    install: bool = typer.Option(
+        False,
+        "--install",
+        help="Install each patched APK to device (use with caution for multiple)",
+    ),
+    launch: bool = typer.Option(
+        False,
+        "--launch/--no-launch",
+        help="Launch after each install",
+    ),
 ) -> None:
     """Apply the same natural-language patch description to multiple APKs in one command.
 
@@ -350,6 +387,8 @@ def batch(
             output_dir=output_dir,
             model=model,
             observe_runtime=not no_observe,
+            install=install,
+            launch=launch,
         )
 
         success_count = sum(1 for r in results if r.get("success", False))

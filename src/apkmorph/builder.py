@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from apkmorph.utils import run_apktool
+from apkmorph.utils import run_adb, run_apktool
 
 
 class APKBuilder:
@@ -54,7 +54,6 @@ class APKBuilder:
         if not str(output_path).lower().endswith(".apk"):
             output_path = output_path.with_suffix(".apk")
 
-        console_msg = f"[blue]Rebuilding with Apktool → {output_path.name}[/blue]"
         try:
             # -f forces overwrite; no --force-stop (invalid flag). Apktool
             # will regenerate resources.arsc after any XML/string edits.
@@ -188,3 +187,73 @@ class APKBuilder:
         if final != signed:
             signed.rename(final)
         return final
+
+    def install_on_device(
+        self,
+        apk_path: str,
+        package_name: str,
+        main_activity: Optional[str] = None,
+        launch: bool = True,
+    ) -> None:
+        """Enable direct push: installs the APK on the first connected device
+        using adb and optionally launches the main activity.
+        """
+        apk = Path(apk_path).resolve()
+        if not apk.exists():
+            raise FileNotFoundError(f"APK not found for install: {apk}")
+
+        if not package_name or package_name == "unknown.package":
+            raise ValueError("Valid package_name required for device install")
+
+        # Verify device is connected
+        try:
+            devices_output = run_adb(["devices"])
+            device_lines = [
+                line
+                for line in devices_output.split("\n")
+                if "device" in line and "List" not in line
+            ]
+            if not device_lines:
+                raise RuntimeError(
+                    "No connected Android device or emulator found.\n"
+                    "Connect a device, enable USB debugging, and verify with 'adb devices'."
+                )
+        except Exception as exc:
+            raise RuntimeError(f"Could not check devices with adb: {exc}") from exc
+
+        # Install (replace existing)
+        try:
+            run_adb(["install", "-r", str(apk)])
+        except Exception as exc:
+            raise RuntimeError(f"Install failed: {exc}") from exc
+
+        if not launch or not main_activity:
+            return
+
+        # Launch
+        try:
+            if main_activity.startswith(package_name):
+                activity_part = main_activity[len(package_name) :].strip(".")
+                if not activity_part.startswith("."):
+                    activity_part = f".{activity_part}"
+                component = f"{package_name}/{activity_part}"
+            elif main_activity.startswith("."):
+                component = f"{package_name}/{main_activity}"
+            else:
+                component = f"{package_name}/{main_activity}"
+            run_adb(
+                [
+                    "shell",
+                    "am",
+                    "start",
+                    "-n",
+                    component,
+                    "-a",
+                    "android.intent.action.MAIN",
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                ]
+            )
+        except Exception as exc:
+            # Launch is best-effort; app is already installed
+            raise RuntimeError(f"Launch failed but app is installed: {exc}") from exc
