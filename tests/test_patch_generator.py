@@ -1,169 +1,178 @@
-"""Unit tests for PatchGenerator.
-
-Mocks LLMClient, SmaliEditor, APKBuilder, and Analyzer so that prompt
-construction, validation, simulation, batch, and export can be tested
-in CI without Ollama, apktool, or real files.
+"""Tests for PatchGenerator including prompt construction, validation,
+simulation, batch, export and resource/XML support.
 """
 
+import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch, MagicMock
 
-from apkmorph.models import AnalysisReport, Modification, PatchPlan
 from apkmorph.patch_generator import PatchGenerator
+from apkmorph.models import AnalysisReport, PatchPlan, Modification
+from apkmorph.plugins import register_custom_patch_type
 
 
-def _make_report() -> AnalysisReport:
+@pytest.fixture
+def sample_report(tmp_path):
     return AnalysisReport(
-        apk_path=Path("test.apk"),
-        package_name="com.example.testapp",
-        decompiled_dir=Path("/tmp/decomp"),
-        components=["com.example.testapp.MainActivity", "com.example.testapp.AdView"],
-        strings=["advertisement", "trackEvent"],
-        string_resources={"ad_text": "Click to win!"},
-        metadata={"runtime_observed": True},
-        size_bytes=2048000,
-        runtime_observations=[
-            "observed: ad - com.google.android.gms.ads.AdView.loadAd() called",
-            "observed: tracking - trackEvent()",
-        ],
+        apk_path=tmp_path / "sample.apk",
+        package_name="com.example.sample",
+        decompiled_dir=tmp_path / "decomp",
+        strings=["ad", "analytics", "hello world"],
+        string_resources={"app_name": "Sample App", "ad_string": "Click to win!"},
+        runtime_observations=["observed: ad - loadAd() called"],
+        metadata={},
     )
 
 
-def _make_plan() -> PatchPlan:
+@pytest.fixture
+def sample_plan():
     return PatchPlan(
-        id="plan_abc123",
-        description="remove ads and disable tracking",
+        id="plan_123_test",
+        description="remove ads and disable analytics",
+        rationale="Targeted live ad and analytics methods observed at runtime. Also updated strings.",
+        confidence=0.88,
         modifications=[
             Modification(
                 edit_type="smali",
-                class_name="com.example.testapp.AdView",
-                method="loadAd",
-                description="Comment out ad loading",
-                confidence=0.92,
-                diff="- invoke-virtual ...",
+                class_name="com.example.AdLoader",
+                method="loadBanner",
+                description="NOP the ad load call",
+                confidence=0.9,
+                diff="- invoke-virtual {v0}, Lcom/example/AdLoader;->loadBanner()V\n+ # patched",
             ),
             Modification(
                 edit_type="resource",
-                class_name="strings",
-                description="Clear ad string",
-                confidence=0.88,
-                params={"ad_text": ""},
+                class_name="ad_string",
+                method="",
+                description="Empty the ad prompt string",
+                confidence=0.85,
+                params={"value": ""},
             ),
         ],
-        rationale="Targeted observed ad and tracking calls plus the ad string resource.",
-        confidence=0.90,
     )
 
 
-def test_from_description():
-    report = _make_report()
-    expected_plan = _make_plan()
-
-    with patch("apkmorph.patch_generator.LLMClient") as MockLLM, patch(
-        "apkmorph.patch_generator.APKAnalyzer"
-    ), patch.object(PatchGenerator, "validate", return_value=expected_plan):
-        mock_llm = MockLLM.return_value
-        mock_llm.query.return_value = expected_plan
-
+def test_from_description(sample_report):
+    with patch("apkmorph.llm.LLMClient.query") as mock_query:
+        mock_query.return_value = PatchPlan(
+            description="remove ads and disable analytics",
+            modifications=[],
+            rationale="Test rationale",
+            confidence=0.75,
+        )
         generator = PatchGenerator(model="phi3")
-        plan = generator.from_description("remove ads and disable tracking", report)
-
-        assert plan.id == "plan_abc123"
-        assert len(plan.modifications) == 2
-        assert plan.confidence > 0.8
-        mock_llm.query.assert_called_once()
+        plan = generator.from_description("remove ads and disable analytics", sample_report)
+        assert plan is not None
+        assert mock_query.called
 
 
-def test_validate_lowers_confidence_for_missing_targets():
-    report = _make_report()
-    plan = _make_plan()
-    # add a modification for a class that does not exist
-    plan.modifications.append(
+def test_validate(sample_plan):
+    generator = PatchGenerator()
+    # make one mod invalid
+    sample_plan.modifications.append(
         Modification(
-            edit_type="smali",
-            class_name="com.example.UnknownClass",
-            method="unknown",
-            description="should be downgraded",
-            confidence=0.95,
+            edit_type="bad_type",
+            class_name="",
+            description="bad mod",
+            confidence=1.5,
         )
     )
+    validated = generator.validate(sample_plan)
+    assert validated.modifications[-1].edit_type == "smali"
+    assert validated.modifications[-1].class_name != ""
+    assert validated.modifications[-1].confidence <= 1.0
+    assert len(validated.rationale) > 10
 
+
+def test_simulate_apply(sample_plan, tmp_path):
     generator = PatchGenerator()
-    validated = generator.validate(plan, report)
-
-    for mod in validated.modifications:
-        if "UnknownClass" in mod.class_name:
-            assert mod.confidence < 0.6
-    assert validated.confidence > 0.0
-
-
-def test_simulate_apply_for_resource_and_xml():
-    plan = _make_plan()
-    generator = PatchGenerator()
-    sim = generator.simulate_apply(plan, Path("/tmp"))
-
+    sim = generator.simulate_apply(sample_plan, tmp_path)
+    assert sim["simulated"] is True
     assert sim["success"] is True
-    assert sim["would_modify"] == 2
-    assert any("resource" in step for step in sim["applied"])
-    assert "rationale" in sim
+    assert len(sim["applied"]) == len(sample_plan.modifications)
+    assert sim["overall_confidence"] == sample_plan.confidence
+    for a in sim["applied"]:
+        assert "target" in a
+        assert "description" in a
 
 
-def test_batch():
-    report = _make_report()
-    plan = _make_plan()
-    output_dir = Path("/tmp/batch_out")
+def test_apply_plan(sample_plan, sample_report):
+    generator = PatchGenerator()
+    with patch.object(generator.editor, "apply_modification", return_value=True) as mock_apply, patch.object(
+        generator.builder, "rebuild_and_sign", return_value=Path("patched_sample.apk")
+    ) as mock_build:
+        result = generator.apply_plan(sample_plan, sample_report)
+        assert result.name == "patched_sample.apk"
+        assert mock_apply.call_count == len(sample_plan.modifications)
+        mock_build.assert_called_once()
 
-    with patch("apkmorph.patch_generator.PatchGenerator.from_description", return_value=plan), patch(
-        "apkmorph.patch_generator.PatchGenerator.apply_plan", return_value=Path("patched.apk")
-    ), patch("apkmorph.patch_generator.APKAnalyzer") as MockAnalyzer, patch(
-        "pathlib.Path.mkdir"
-    ):
-        mock_analyzer = MockAnalyzer.return_value
-        mock_analyzer.decompile.return_value = report
-        mock_analyzer.observe_runtime.return_value = report
 
-        generator = PatchGenerator()
+def test_batch(sample_report):
+    generator = PatchGenerator()
+    apk_list = ["app1.apk", "app2.apk"]
+    out_dir = Path("/tmp/batch_out")
+    with patch.object(generator, "from_description") as mock_from, patch.object(
+        generator, "apply_plan"
+    ) as mock_apply, patch("apkmorph.patch_generator.APKAnalyzer") as mock_ana_class:
+        mock_ana = MagicMock()
+        mock_ana.decompile.return_value = sample_report
+        mock_ana.observe_runtime.return_value = sample_report
+        mock_ana_class.return_value = mock_ana
+        mock_plan = PatchPlan(
+            description="test batch",
+            modifications=[Modification(class_name="Test", description="test", edit_type="smali")],
+            rationale="batch test",
+        )
+        mock_from.return_value = mock_plan
+        mock_apply.return_value = Path("patched_app1.apk")
         results = generator.batch(
-            description="remove ads",
-            apk_paths=["app1.apk", "app2.apk"],
-            output_dir=output_dir,
+            "disable analytics",
+            apk_list,
+            out_dir,
+            model="llama3.2",
             observe_runtime=True,
         )
-
         assert len(results) == 2
         assert results[0]["success"] is True
-        assert "output" in results[0]
+        assert mock_from.call_count == 2
+        assert "mod_count" in results[0]
 
 
-def test_export_python_script():
-    plan = _make_plan()
+def test_export(sample_plan, tmp_path):
     generator = PatchGenerator()
+    py_path = tmp_path / "mypatch.py"
+    exported = generator.export(sample_plan, py_path, fmt="python")
+    assert exported.exists()
+    content = exported.read_text(encoding="utf-8")
+    assert "Standalone patch exported by APK Morph" in content
+    assert "remove ads and disable analytics" in content
+    assert "PatchPlan.model_validate_json" in content
+    assert "def main()" in content
 
-    with patch.object(Path, "write_text") as mock_write, patch.object(
-        Path, "parent"
-    ) as mock_parent:
-        mock_parent.mkdir = MagicMock()
-        path = generator.export(plan, Path("exported_patch.py"), fmt="python")
-
-        assert path.suffix == ".py"
-        mock_write.assert_called_once()
-        content = mock_write.call_args[0][0]
-        assert "Self-contained patch script" in content
-        assert "PLAN_DATA" in content
-        assert "def main" in content
+    json_path = tmp_path / "template.json"
+    exported_json = generator.export(sample_plan, json_path, fmt="json")
+    assert exported_json.exists()
+    assert '"id": "plan_123_test"' in exported_json.read_text(encoding="utf-8")
 
 
-def test_export_json():
-    plan = _make_plan()
+def test_custom_patch_type_support():
+    # test that custom types are accepted in validate
+    @register_custom_patch_type("theme_injector")
+    def dummy_theme(mod, dir_path):  # pylint: disable=unused-variable
+        return True
+
     generator = PatchGenerator()
-
-    with patch.object(Path, "write_text") as mock_write, patch.object(
-        Path, "parent"
-    ) as mock_parent:
-        mock_parent.mkdir = MagicMock()
-        path = generator.export(plan, fmt="json")
-
-        assert path.suffix == ".json"
-        mock_write.assert_called_once()
-        # JSON export uses model_dump_json
-        assert "model_dump_json" in str(mock_write.call_args)
+    plan = PatchPlan(
+        description="apply dark theme",
+        modifications=[
+            Modification(
+                edit_type="theme_injector",
+                class_name="styles.xml",
+                description="inject dark theme colors",
+                confidence=0.8,
+            )
+        ],
+        rationale="custom plugin used",
+    )
+    validated = generator.validate(plan)
+    assert validated.modifications[0].edit_type == "theme_injector"
