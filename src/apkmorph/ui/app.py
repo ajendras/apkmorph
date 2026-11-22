@@ -1,163 +1,225 @@
 """Streamlit UI for APK Morph.
 
-Provides a clean dashboard with APK upload, natural-language prompt input,
-analysis summary, PatchPlan display and the new interactive side-by-side
-Smali diff viewer (hover any highlighted line for an explanation). One-click
-rebuild and download of the signed APK.
+Provides upload, natural-language prompt input, confidence scoring UI element
+with color-coded metrics and progress bar, side-by-side diff viewer, and a
+user feedback form that triggers LLM prompt refinement via PatchGenerator.refine_plan().
 """
 
-import streamlit as st
-from pathlib import Path
-import tempfile
 import shutil
+import tempfile
+from pathlib import Path
+
+import streamlit as st
 
 from apkmorph.analyzer import APKAnalyzer
-from apkmorph.patch_generator import PatchGenerator
 from apkmorph.builder import APKBuilder
-from apkmorph.models import AnalysisReport, PatchPlan
-from apkmorph.smali import SmaliEditor
+from apkmorph.models import AnalysisReport
+from apkmorph.patch_generator import PatchGenerator
 
 
 st.set_page_config(
     page_title="APK Morph",
-    page_icon="📦",
+    page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
 def main() -> None:
-    st.title("📦 APK Morph")
-    st.markdown(
-        "Describe the change you want. Local AI finds the code, shows an "
-        "**interactive side-by-side diff** with hover explanations, then rebuilds a signed APK."
+    st.title("🧬 APK Morph")
+    st.caption(
+        "Natural-language AI patching • Local Ollama • Confidence scoring & feedback-driven refinement"
     )
 
-    # Sidebar controls
     with st.sidebar:
-        st.header("APK")
+        st.header("Configuration")
+        model = st.selectbox(
+            "Ollama model",
+            options=["llama3.2", "gemma2", "phi3"],
+            index=0,
+        )
+        observe = st.checkbox("Observe runtime (Frida)", value=True)
+        st.caption("Feedback submitted in the main view is automatically injected into the next LLM prompt.")
+
+    tab1, tab2 = st.tabs(["Patch Generator", "Batch & Export"])
+
+    with tab1:
         uploaded = st.file_uploader(
-            "Upload an APK", type=["apk"], label_visibility="collapsed"
-        )
-        analyze_btn = st.button("Analyze APK", type="primary", use_container_width=True)
-
-        st.divider()
-        st.caption("Configuration")
-        model = st.selectbox("Ollama model", ["llama3.2", "llama3", "phi3"], index=0)
-        observe_runtime = st.checkbox("Observe runtime with Frida", value=True)
-
-    # Session state
-    if "report" not in st.session_state:
-        st.session_state.report = None
-    if "plan" not in st.session_state:
-        st.session_state.plan = None
-    if "decompiled_temp" not in st.session_state:
-        st.session_state.decompiled_temp = None
-
-    analyzer = APKAnalyzer(working_dir=Path("decompiled_ui"))
-    generator = PatchGenerator(model=model)
-    builder = APKBuilder()
-    editor = SmaliEditor()
-
-    # Analysis flow
-    if uploaded and analyze_btn:
-        with st.spinner("Decompiling APK and extracting metadata..."):
-            # Save uploaded file to a temporary location
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".apk") as tmp:
-                tmp.write(uploaded.getvalue())
-                tmp_path = Path(tmp.name)
-
-            try:
-                report = analyzer.decompile(str(tmp_path))
-                if observe_runtime:
-                    report = analyzer.observe_runtime(report)
-                st.session_state.report = report
-                st.session_state.decompiled_temp = report.decompiled_dir
-                st.success(f"Analyzed {report.package_name}")
-            except Exception as e:
-                st.error(f"Analysis failed: {e}")
-            finally:
-                tmp_path.unlink(missing_ok=True)
-
-    report: AnalysisReport | None = st.session_state.report
-
-    if report:
-        st.subheader("Analysis Summary")
-        st.info(report.summary())
-
-        with st.expander("Full report (Markdown)", expanded=False):
-            st.markdown(report.to_markdown())
-
-        # Natural language request
-        st.subheader("What should we change?")
-        description = st.text_area(
-            "Describe the change in plain English",
-            placeholder='Disable analytics, remove all ads, change the app name to "MyCustomApp"',
-            height=80,
-            key="prompt",
+            "Upload APK", type=["apk"], help="Any Android package (.apk)"
         )
 
-        if st.button("Generate Patch Plan", type="primary"):
-            with st.spinner("Querying local LLM and building plan..."):
-                try:
-                    plan = generator.from_description(
-                        description, report, observe=observe_runtime
-                    )
-                    st.session_state.plan = plan
-                    st.success("Patch plan generated")
-                except Exception as e:
-                    st.error(f"Failed to generate plan: {e}")
+        if uploaded:
+            tmp_dir = Path(tempfile.mkdtemp())
+            apk_path = tmp_dir / uploaded.name
+            with open(apk_path, "wb") as f:
+                f.write(uploaded.getbuffer())
 
-    plan: PatchPlan | None = st.session_state.plan
+            st.success(f"Loaded {uploaded.name}")
 
-    if plan:
-        st.divider()
-        st.subheader("🧠 Patch Plan")
-        st.caption(plan.description)
+            analyzer = APKAnalyzer(working_dir=tmp_dir / "decompiled")
+            with st.spinner("Decompiling and extracting metadata..."):
+                report: AnalysisReport = analyzer.decompile(str(apk_path))
+                if observe:
+                    with st.spinner("Observing runtime (or simulating)..."):
+                        report = analyzer.observe_runtime(report)
 
-        col_rat, col_conf = st.columns([3, 1])
-        with col_rat:
-            st.markdown(f"**Rationale**  \n{plan.rationale}")
-        with col_conf:
-            st.metric("Overall confidence", f"{plan.confidence:.2f}")
+            st.session_state.report = report
+            st.subheader("Analysis")
+            st.info(report.summary())
 
-        st.subheader("Interactive Diff Viewer")
-        st.caption("Hover highlighted lines in the **Patched** column for explanations")
+            description = st.text_area(
+                "What change do you want?",
+                placeholder='disable all analytics, remove ads, change primary color to #FF5722',
+                height=80,
+                key="prompt_input",
+            )
 
-        for i, mod in enumerate(plan.modifications):
-            with st.expander(
-                f"{i+1}. {mod.class_name} • {mod.method}  "
-                f"(confidence {mod.confidence:.2f})",
-                expanded=i == 0,
-            ):
-                # Render the interactive HTML viewer
-                html = editor.get_diff_html(mod)
-                st.components.v1.html(html, height=520, scrolling=True)
+            if st.button("Generate Plan", type="primary"):
+                if not description.strip():
+                    st.error("Please enter a description")
+                else:
+                    with st.spinner("Querying local LLM..."):
+                        generator = PatchGenerator(model=model)
+                        plan = generator.from_description(description, report)
+                        st.session_state.current_plan = plan
+                        st.session_state.feedback_history = []
+                        st.rerun()
 
-        # Apply & rebuild section
-        if st.button("Apply Patches & Rebuild Signed APK", type="primary", use_container_width=True):
-            with st.spinner("Applying patches and rebuilding..."):
-                try:
-                    # Apply each modification to the decompiled tree
-                    for mod in plan.modifications:
-                        editor.apply_modification(report.decompiled_dir, mod)
+            if "current_plan" in st.session_state:
+                plan = st.session_state.current_plan
+                report = st.session_state.report
 
-                    signed_apk = builder.rebuild_and_sign(str(report.decompiled_dir))
-                    st.success(f"Built: {signed_apk.name}")
+                st.divider()
+                st.subheader("📊 Confidence Scoring")
+                conf = plan.confidence
+                if conf >= 0.8:
+                    color = "#22c55e"
+                    label = "HIGH"
+                elif conf >= 0.6:
+                    color = "#eab308"
+                    label = "MEDIUM"
+                else:
+                    color = "#ef4444"
+                    label = "LOW – refine below"
+                st.markdown(
+                    f"""
+                    <div style="background:{color}15;border:2px solid {color};border-radius:8px;padding:16px;margin-bottom:16px">
+                        <span style="font-size:2.2rem;font-weight:bold;color:{color}">{label}</span><br>
+                        <span style="font-size:3rem;font-weight:bold;color:{color}">{conf:.2f}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.progress(conf)
+                st.caption("LLM-generated confidence. Higher is better. Use the feedback form to improve it.")
 
-                    with open(signed_apk, "rb") as f:
-                        st.download_button(
-                            label="Download patched APK",
-                            data=f,
-                            file_name=signed_apk.name,
-                            mime="application/vnd.android.package-archive",
-                        )
-                except Exception as e:
-                    st.error(f"Build failed: {e}")
+                st.subheader("Rationale")
+                st.write(plan.rationale)
 
-        if st.button("Clear plan"):
-            st.session_state.plan = None
-            st.rerun()
+                st.subheader("Proposed Modifications")
+                for i, mod in enumerate(plan.modifications):
+                    with st.expander(
+                        f"#{i+1} {mod.class_name.split('.')[-1]} • {mod.method or 'global'} "
+                        f"(confidence {mod.confidence:.2f})",
+                        expanded=i == 0,
+                    ):
+                        st.write(mod.description)
+                        if mod.diff:
+                            col_orig, col_new = st.columns(2)
+                            with col_orig:
+                                st.markdown("**Before**")
+                                st.code(
+                                    "\n".join(
+                                        line for line in mod.diff.split("\n") if line.startswith("-") or not line.startswith(("+", "-"))
+                                    ),
+                                    language="smali",
+                                )
+                            with col_new:
+                                st.markdown("**After**")
+                                st.code(
+                                    "\n".join(
+                                        line for line in mod.diff.split("\n") if line.startswith("+") or not line.startswith(("+", "-"))
+                                    ),
+                                    language="smali",
+                                )
+                        st.metric("Mod Confidence", f"{mod.confidence:.2f}")
+
+                st.divider()
+                st.subheader("🔄 User Feedback Loop")
+                st.info(
+                    "Tell the AI what to improve. Your text is appended to the system prompt on the next generation."
+                )
+                rating = st.slider(
+                    "Your own confidence rating for this plan",
+                    0.0,
+                    1.0,
+                    float(plan.confidence),
+                    0.05,
+                )
+                feedback_text = st.text_area(
+                    "Feedback / corrections",
+                    value="",
+                    placeholder="Target the loadAd() method in the banner class instead. Avoid removing the whole permission block.",
+                    height=110,
+                )
+
+                if st.button("Refine Prompt with Feedback", type="secondary"):
+                    if feedback_text.strip():
+                        with st.spinner("Generating refined plan..."):
+                            generator = PatchGenerator(model=model)
+                            refined = generator.refine_plan(plan, feedback_text, report)
+                            refined.confidence = (refined.confidence + rating) / 2
+                            st.session_state.current_plan = refined
+                            st.session_state.feedback_history.append(feedback_text)
+                            st.success("Plan refined – review the new confidence score above.")
+                            st.rerun()
+                    else:
+                        st.warning("Enter feedback before refining.")
+
+                if st.button("Build & Sign APK", type="primary"):
+                    with st.spinner("Applying patches, rebuilding, signing..."):
+                        try:
+                            generator = PatchGenerator(model=model)
+                            out_apk = generator.apply_plan(plan, report, install=False, launch=False)
+                            st.balloons()
+                            st.success(f"Finished: {out_apk.name}")
+                            with open(out_apk, "rb") as f:
+                                st.download_button(
+                                    label="Download patched APK",
+                                    data=f,
+                                    file_name=out_apk.name,
+                                    mime="application/vnd.android.package-archive",
+                                )
+                        except Exception as e:
+                            st.error(f"Build error: {e}")
+
+    with tab2:
+        st.subheader("Batch Processing")
+        st.caption("Run the same request on many APKs (uses the feedback-aware generator).")
+        st.info("Batch functionality is available from the CLI (`apkmorph batch ...`). The UI focuses on single-APK interactive refinement.")
+
+        st.subheader("Export")
+        if "current_plan" in st.session_state:
+            plan = st.session_state.current_plan
+            if st.button("Export as Python script"):
+                generator = PatchGenerator()
+                path = generator.export(plan, fmt="python")
+                with open(path, "rb") as f:
+                    st.download_button("Download .py", f, file_name=path.name)
+            if st.button("Export as JSON template"):
+                generator = PatchGenerator()
+                path = generator.export(plan, fmt="json")
+                with open(path, "rb") as f:
+                    st.download_button("Download .json", f, file_name=path.name)
+        else:
+            st.caption("Generate a plan first to enable export.")
+
+    # Cleanup helper
+    if st.button("Clear temporary files"):
+        for p in Path("decompiled_ui").glob("**/*"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+        st.success("Temporary files cleared.")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 Defines immutable data structures for analysis reports, patch plans,
 and modifications. Supports string resources, runtime observations
 from Frida, XML/resource edits, and custom plugin edit types.
+Now includes feedback_history to support the iterative prompt refinement loop.
 """
 
 from datetime import datetime
@@ -31,7 +32,9 @@ class Modification(BaseModel):
 
 
 class PatchPlan(BaseModel):
-    """LLM-generated plan containing one or more modifications."""
+    """LLM-generated plan containing one or more modifications.
+    Supports feedback_history for the UI refinement loop.
+    """
 
     id: str = Field(
         default_factory=lambda: f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -42,12 +45,16 @@ class PatchPlan(BaseModel):
     rationale: str = Field(default="", description="LLM reasoning and explanations")
     confidence: float = Field(default=0.75, ge=0.0, le=1.0)
     created_at: datetime = Field(default_factory=datetime.now)
+    feedback_history: List[str] = Field(
+        default_factory=list, description="User feedback used for iterative refinement"
+    )
 
     def summary(self) -> str:
         """Short summary for CLI/UI."""
+        fb = f", {len(self.feedback_history)} refinements" if self.feedback_history else ""
         return (
             f"PatchPlan {self.id} — {len(self.modifications)} mods, "
-            f"confidence {self.confidence:.2f}"
+            f"confidence {self.confidence:.2f}{fb}"
         )
 
 
