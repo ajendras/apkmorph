@@ -70,12 +70,18 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 - Ollama running (APK Morph will automatically download Gemma 2, Phi 3, Code Llama and other supported models on first use)
 - Apktool, zipalign and apksigner on your PATH (Android SDK build-tools)
 - Java runtime
-- Frida server on device/emulator (for runtime observation)
 - adb on PATH (Android SDK platform-tools) for `--install` / `--launch`
+- Frida + frida-server on device/emulator (**optional** — enables runtime observation; install with `pip install -e ".[frida]"`)
 
 ```bash
 pip install -e .
 apkmorph ui
+```
+
+For runtime-aware patches install the optional extra:
+
+```bash
+pip install -e ".[frida]"
 ```
 
 The CLI entry point `apkmorph` is automatically installed from `pyproject.toml`.
@@ -86,7 +92,7 @@ The CLI entry point `apkmorph` is automatically installed from `pyproject.toml`.
 # 1. Analyze an APK
 apkmorph analyze sample.apk -o report.md
 
-# 2. Generate a patch plan from natural language (uses Frida runtime data)
+# 2. Generate a patch plan from natural language (uses optional Frida runtime data)
 apkmorph patch "disable all analytics, remove ads and change app name" sample.apk --model gemma2
 
 # 3. Apply the plan, install on device and launch
@@ -310,7 +316,7 @@ flowchart TD
 pytest -q
 ```
 
-Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the new Frida runtime observation path (with realistic simulation fallback). The new `test_apply_plan_rollback_on_failure` exercises the automatic backup/rollback path when `rebuild_and_sign` raises an error. The `test_apply_plan_with_device_push` (and related mocks for `install_on_device`) exercises the ADB integration. Run with `pytest -q --cov` using the config in `pyproject.toml`.
+Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the Frida runtime observation path (with realistic simulation fallback when the optional frida package is not installed). The new `test_apply_plan_rollback_on_failure` exercises the automatic backup/rollback path when `rebuild_and_sign` raises an error. The `test_apply_plan_with_device_push` (and related mocks for `install_on_device`) exercises the ADB integration. Run with `pytest -q --cov` using the config in `pyproject.toml`.
 
 ## 📍 Roadmap
 

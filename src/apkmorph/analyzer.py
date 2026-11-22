@@ -4,9 +4,11 @@ Provides APKAnalyzer for decompiling APKs with Apktool, extracting rich
 metadata via Androguard, and supporting keyword/component searches for
 the LLM patch generator. Now includes intelligent extraction of
 string resources that feed AI-suggested XML edits (resources.arsc
-is rebuilt automatically by Apktool after XML edits) and Frida-based
-runtime observation to capture live method behavior before patch
-generation.
+is rebuilt automatically by Apktool after XML edits) and optional
+Frida-based runtime observation to capture live method behavior before
+patch generation. Frida is an optional dependency; when unavailable
+(realistic simulation based on strings is used). All operations are
+local and deterministic.
 """
 
 import hashlib
@@ -22,15 +24,6 @@ from apkmorph.models import AnalysisReport
 from apkmorph.utils import run_apktool
 
 
-_FRIDA_AVAILABLE = False
-frida = None
-try:
-    import frida
-    _FRIDA_AVAILABLE = True
-except Exception:  # ImportError, OSError, RuntimeError etc. (e.g. missing native libraries in CI)
-    pass  # fallback to simulation mode is used for tests and environments without full Frida support
-
-
 class APKAnalyzer:
     """Analyzes Android APKs by decompiling with Apktool and parsing with Androguard.
 
@@ -38,9 +31,9 @@ class APKAnalyzer:
     permissions, strings, string_resources, runtime_observations and a reference
     to the decompiled source tree. Resource strings are extracted from XML
     (resources.arsc is rebuilt automatically by Apktool after XML edits).
-    Runtime observation via Frida (or realistic simulation) feeds live method
-    calls into the LLM for higher-quality patches.
-    All operations are local and deterministic.
+    Runtime observation via optional Frida (or realistic simulation) feeds live
+    method calls into the LLM for higher-quality patches. All operations are
+    local and deterministic.
     """
 
     def __init__(self, working_dir: str | Path = Path("decompiled")) -> None:
@@ -266,9 +259,11 @@ class APKAnalyzer:
         """Enrich an AnalysisReport with runtime observations gathered by injecting
         Frida scripts into a running app on a USB-connected device or emulator.
 
-        If Frida/server/device is unavailable, realistic simulated observations
-        based on extracted strings are supplied. The resulting runtime_observations
-        are fed to the LLM so that patches target only live code paths.
+        The optional ``frida`` dependency is imported lazily. If it is not installed
+        or any runtime error occurs (no device, no frida-server, etc.), realistic
+        simulated observations based on extracted strings are supplied. The resulting
+        runtime_observations are fed to the LLM so that patches target only live
+        code paths.
 
         Args:
             report: AnalysisReport from decompile()
@@ -277,12 +272,12 @@ class APKAnalyzer:
         Returns:
             Updated AnalysisReport (model_copy) containing runtime_observations
         """
-        observations = self._run_frida_observation(
+        observations, frida_used = self._run_frida_observation(
             report.package_name, duration, report.strings
         )
         updated_metadata = dict(report.metadata)
         updated_metadata["runtime_observed"] = len(observations) > 0
-        updated_metadata["frida_used"] = _FRIDA_AVAILABLE
+        updated_metadata["frida_used"] = frida_used
         return report.model_copy(
             update={
                 "runtime_observations": observations,
@@ -292,19 +287,21 @@ class APKAnalyzer:
 
     def _run_frida_observation(
         self, package_name: str, duration: int = 10, strings: List[str] | None = None
-    ) -> List[str]:
+    ) -> Tuple[List[str], bool]:
         """Run Frida observation or fall back to simulation.
 
-        Real Frida path requires a device with frida-server running and the
-        target package installed. Any error (no device, connection refused,
-        missing server, etc.) falls back to high-quality simulation.
+        Real Frida path requires the optional frida package, a device with
+        frida-server running and the target package installed. Any error
+        (ImportError, no device, connection refused, missing server, etc.)
+        falls back to high-quality simulation based on the package name and
+        extracted strings. Returns the observations list and a boolean
+        indicating whether real Frida was used.
         """
         strings = strings or []
-        if not _FRIDA_AVAILABLE:
-            return self._simulate_observations(package_name, strings)
-
-        observations: List[str] = []
         try:
+            import frida
+
+            observations: List[str] = []
             device = frida.get_usb_device(timeout=5)
             pid = device.spawn(package_name)
             session = device.attach(pid)
@@ -330,9 +327,9 @@ class APKAnalyzer:
 
             if not observations:
                 observations.append("observed: no matching calls during runtime (hooks ready)")
-            return observations
+            return observations, True
         except Exception:
-            return self._simulate_observations(package_name, strings)
+            return self._simulate_observations(package_name, strings), False
 
     def _frida_script(self) -> str:
         """Return a Frida JS script with hooks for common analytics, ads,
