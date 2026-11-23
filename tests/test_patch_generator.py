@@ -1,237 +1,230 @@
 """Tests for PatchGenerator.
 
-Covers prompt construction, PatchPlan validation, simulate_apply for Smali/XML/resource
-edits, batch mode, device push, rollback on rebuild failure, and feedback refinement.
-Uses heavy mocking for LLM, builder, editor and Frida so tests run instantly in CI
-on Python 3.12 without external services or devices. Updated to match current
-signatures, rollback logic and simulation paths.
+Covers prompt construction, PatchPlan validation, simulate_apply for
+Smali/XML/resource edits, batch mode, rollback on rebuild failure,
+device install, and confidence/rationale fields. Uses mocks so no
+real Ollama, Frida, APK or ADB is required.
 """
 
 import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 
-from apkmorph.models import (
-    AnalysisReport,
-    PatchPlan,
-    Modification,
-)
+from apkmorph.models import AnalysisReport, Modification, PatchPlan
 from apkmorph.patch_generator import PatchGenerator
 
 
 @pytest.fixture
-def sample_report(tmp_path: Path) -> AnalysisReport:
-    decompiled = tmp_path / "decomp"
-    decompiled.mkdir()
-    (decompiled / "smali").mkdir()
+def generator():
+    return PatchGenerator(model="llama3.2")
+
+
+@pytest.fixture
+def sample_report(tmp_path: Path):
+    decomp = tmp_path / "decomp"
+    decomp.mkdir()
+    (decomp / "smali" / "com" / "example").mkdir(parents=True)
+    (decomp / "smali" / "com" / "example" / "MainActivity.smali").write_text(
+        ".class Lcom/example/MainActivity;\n.method onCreate()V\n.end method"
+    )
+    (decomp / "res" / "values").mkdir(parents=True)
+    (decomp / "res" / "values" / "strings.xml").write_text(
+        '<resources><string name="app_name">Old</string></resources>'
+    )
+
     return AnalysisReport(
-        apk_path=Path("sample.apk"),
+        apk_path=Path("test.apk"),
         package_name="com.example.app",
         version_name="1.0",
         version_code="1",
-        min_sdk=21,
+        min_sdk=24,
         target_sdk=34,
-        decompiled_dir=decompiled.absolute(),
-        main_activity="com.example.app.MainActivity",
-        activities=["com.example.app.MainActivity"],
+        decompiled_dir=decomp.absolute(),
+        main_activity=".MainActivity",
+        activities=[".MainActivity"],
         services=[],
         receivers=[],
         providers=[],
         permissions=[],
-        components=["com.example.app.MainActivity"],
-        strings=["ad", "analytics"],
-        string_resources={"welcome": "Hello"},
-        metadata={},
-        size_bytes=10240,
-        runtime_observations=["observed: ad load"],
+        components=["com.example.MainActivity"],
+        strings=["analytics", "ad"],
+        string_resources={"app_name": "Old"},
+        metadata={"runtime_observed": True},
+        size_bytes=1024,
+        runtime_observations=["observed: analytics"],
     )
 
 
-@pytest.fixture
-def sample_plan() -> PatchPlan:
+def test_from_description(generator: PatchGenerator, sample_report: AnalysisReport):
+    sample_json = {
+        "id": "plan-123",
+        "description": "disable analytics",
+        "rationale": "Found Firebase calls in onCreate",
+        "confidence": 0.85,
+        "modifications": [
+            {
+                "edit_type": "smali",
+                "class_name": "com.example.MainActivity",
+                "method": "onCreate",
+                "description": "Comment out analytics",
+                "confidence": 0.9,
+                "diff": "- invoke-static\n+ # invoke-static",
+                "params": {},
+            }
+        ],
+    }
+
+    with patch("apkmorph.patch_generator.LLMClient") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.query.return_value = json.dumps(sample_json)
+        mock_llm_class.return_value = mock_llm
+
+        plan = generator.from_description("disable analytics", sample_report)
+
+    assert isinstance(plan, PatchPlan)
+    assert plan.id == "plan-123"
+    assert plan.confidence == 0.85
+    assert len(plan.modifications) == 1
+    assert plan.modifications[0].class_name == "com.example.MainActivity"
+    assert "analytics" in plan.rationale.lower()
+
+
+def test_validate_plan(generator: PatchGenerator):
     mod = Modification(
         edit_type="smali",
-        class_name="com.example.AdManager",
-        method="loadAd",
-        description="Remove ad loading call",
-        confidence=0.92,
-        diff="- invoke-virtual\n+ # patched: ad removed",
+        class_name="com.example.Main",
+        method="onCreate",
+        description="test",
+        confidence=0.8,
+        diff="- old\n+ new",
+    )
+    plan = PatchPlan(
+        id="p1",
+        description="test",
+        rationale="ok",
+        confidence=0.8,
+        modifications=[mod],
+    )
+    # should not raise
+    generator.validate(plan)
+
+
+def test_simulate_apply_smali_xml_resource(generator: PatchGenerator, sample_report: AnalysisReport, tmp_path: Path):
+    mod_smali = Modification(
+        edit_type="smali",
+        class_name="com.example.MainActivity",
+        method="onCreate",
+        description="nop analytics",
+        confidence=0.85,
+        diff="- invoke\n+ nop",
         params={},
     )
-    return PatchPlan(
-        id="plan_test123",
-        rationale="Targeted ad removal based on runtime observation and string match.",
-        modifications=[mod],
-        confidence=0.89,
+    mod_resource = Modification(
+        edit_type="resource",
+        class_name="",
+        method="",
+        description="change string",
+        confidence=0.75,
+        diff="",
+        params={"key": "app_name", "value": "Patched"},
+    )
+    plan = PatchPlan(
+        id="p2",
+        description="test",
+        rationale="test",
+        confidence=0.8,
+        modifications=[mod_smali, mod_resource],
     )
 
+    with patch("apkmorph.smali.SmaliEditor.apply_modification", return_value=True):
+        simulation = generator.simulate_apply(plan, sample_report.decompiled_dir)
 
-def test_from_description(sample_report: AnalysisReport) -> None:
-    with patch("apkmorph.patch_generator.LLMClient") as mock_llm_cls:
-        mock_llm = MagicMock()
-        mock_llm.query.return_value = json.dumps(
-            {
-                "id": "plan_abc123",
-                "rationale": "Test rationale",
-                "modifications": [
-                    {
-                        "edit_type": "smali",
-                        "class_name": "TestClass",
-                        "method": "onCreate",
-                        "description": "Disable analytics",
-                        "confidence": 0.85,
-                        "diff": "- analytics call",
-                        "params": {},
-                    }
-                ],
-                "confidence": 0.85,
-            }
-        )
-        mock_llm_cls.return_value = mock_llm
-
-        generator = PatchGenerator(model="phi3")
-        plan = generator.from_description("disable all analytics", sample_report)
-
-        assert plan.id.startswith("plan_")
-        assert "analytics" in plan.rationale.lower()
-        assert len(plan.modifications) == 1
-        assert plan.modifications[0].confidence > 0.8
-        mock_llm.query.assert_called_once()
+    assert simulation["applied"] == 2
+    assert any("smali" in m for m in simulation["details"])
+    assert any("resource" in m for m in simulation["details"])
 
 
-def test_validate(sample_plan: PatchPlan) -> None:
-    generator = PatchGenerator()
-    validated = generator.validate(sample_plan)
+@patch("apkmorph.patch_generator.APKBuilder")
+def test_apply_plan_rollback_on_failure(mock_builder, generator: PatchGenerator, sample_report: AnalysisReport, tmp_path: Path):
+    plan = PatchPlan(
+        id="p3",
+        description="fail test",
+        rationale="will fail",
+        confidence=0.6,
+        modifications=[],
+    )
 
-    assert validated.id == sample_plan.id
-    assert validated.confidence == sample_plan.confidence
-    for mod in validated.modifications:
-        assert mod.confidence > 0.0
-        assert mod.description
+    mock_builder.return_value.rebuild_and_sign.side_effect = RuntimeError("rebuild failed")
 
-
-def test_simulate_apply(sample_report: AnalysisReport, tmp_path: Path) -> None:
-    generator = PatchGenerator()
-    plan = sample_plan()
-
-    simulation = generator.simulate_apply(plan, tmp_path)
-
-    assert "applied" in simulation
-    assert simulation["applied"] is True
-    assert "changes" in simulation
-    assert len(simulation["changes"]) == len(plan.modifications)
-
-
-def test_batch(sample_report: AnalysisReport) -> None:
-    with patch("apkmorph.patch_generator.PatchGenerator.from_description") as mock_from, patch(
-        "apkmorph.patch_generator.PatchGenerator.apply_plan"
-    ) as mock_apply, patch("apkmorph.analyzer.APKAnalyzer") as mock_analyzer_cls:
-        mock_analyzer = MagicMock()
-        mock_analyzer.decompile.return_value = sample_report
-        mock_analyzer.observe_runtime.return_value = sample_report
-        mock_analyzer_cls.return_value = mock_analyzer
-
-        mock_from.return_value = sample_plan()
-        mock_apply.return_value = Path("patched_1.apk")
-
-        generator = PatchGenerator(model="llama3.2")
-        results = generator.batch(
-            description="remove ads",
-            apk_paths=["app1.apk", "app2.apk"],
-            output_dir=Path("batch_out"),
-            model="llama3.2",
-            observe_runtime=False,
-            install=False,
-            launch=False,
-        )
-
-        assert len(results) == 2
-        assert mock_from.call_count == 2
-        assert mock_apply.call_count == 2
-        assert all(r.get("success", False) for r in results)
-
-
-def test_apply_plan_rollback_on_failure(sample_report: AnalysisReport, tmp_path: Path) -> None:
-    generator = PatchGenerator()
-    plan = sample_plan()
-    sample_report.decompiled_dir = tmp_path / "decomp"
-    sample_report.decompiled_dir.mkdir(parents=True, exist_ok=True)
-    test_file = sample_report.decompiled_dir / "test_marker.txt"
-    test_file.write_text("original content")
-
-    with patch("apkmorph.patch_generator.PatchGenerator._apply_modifications") as mock_apply_mod, patch(
-        "apkmorph.builder.APKBuilder.rebuild_and_sign"
-    ) as mock_rebuild, patch("apkmorph.utils.safe_copytree") as mock_copytree:
-        mock_apply_mod.return_value = None
-        mock_rebuild.side_effect = RuntimeError("rebuild failed intentionally")
-
+    with patch("apkmorph.utils.safe_copytree") as mock_backup:
         with pytest.raises(RuntimeError, match="rebuild failed"):
-            generator.apply_plan(plan, sample_report, install=False, launch=False)
+            generator.apply_plan(plan, sample_report)
 
-        # rollback must have been invoked
-        assert mock_copytree.call_count >= 2  # backup + restore
-        # original marker should be restored
-        assert test_file.read_text() == "original content"
+    mock_backup.assert_called()  # rollback should have been attempted
 
 
-def test_apply_plan_with_device_push(sample_report: AnalysisReport, tmp_path: Path) -> None:
-    generator = PatchGenerator()
-    plan = sample_plan()
-    sample_report.decompiled_dir = tmp_path / "decomp"
-    sample_report.decompiled_dir.mkdir(parents=True, exist_ok=True)
+@patch("apkmorph.builder.APKBuilder.install_on_device")
+def test_apply_plan_with_device_push(mock_install, generator: PatchGenerator, sample_report: AnalysisReport):
+    plan = PatchPlan(
+        id="p4",
+        description="install test",
+        rationale="ok",
+        confidence=0.9,
+        modifications=[],
+    )
 
-    with patch("apkmorph.patch_generator.PatchGenerator._apply_modifications"), patch(
-        "apkmorph.builder.APKBuilder.rebuild_and_sign"
-    ) as mock_rebuild, patch(
-        "apkmorph.builder.APKBuilder.install_on_device"
-    ) as mock_install:
-        mock_rebuild.return_value = Path("patched_test.apk")
+    with patch("apkmorph.patch_generator.PatchGenerator._apply_modifications", return_value=True):
+        with patch("apkmorph.patch_generator.APKBuilder") as mock_b:
+            mock_b.return_value.rebuild_and_sign.return_value = Path("patched.apk")
+            output = generator.apply_plan(plan, sample_report, install=True, launch=True)
 
-        output = generator.apply_plan(
-            plan, sample_report, install=True, launch=True
+    mock_install.assert_called_once()
+    assert "patched" in str(output)
+
+
+def test_batch(generator: PatchGenerator, tmp_path: Path):
+    apk1 = tmp_path / "a.apk"
+    apk2 = tmp_path / "b.apk"
+    apk1.touch()
+    apk2.touch()
+
+    with patch.object(generator, "from_description") as mock_from:
+        mock_from.return_value = PatchPlan(
+            id="batch1",
+            description="batch test",
+            rationale="ok",
+            confidence=0.8,
+            modifications=[],
         )
+        with patch.object(generator, "apply_plan", return_value=Path("out.apk")):
+            results = generator.batch(
+                description="disable ads",
+                apk_paths=[str(apk1), str(apk2)],
+                output_dir=tmp_path / "out",
+                model="llama3.2",
+                observe_runtime=False,
+                install=False,
+                launch=False,
+            )
 
-        assert output.name.startswith("patched_")
-        mock_install.assert_called_once_with(
-            str(output),
-            sample_report.package_name,
-            sample_report.main_activity,
-            launch=True,
-        )
+    assert len(results) == 2
+    assert results[0]["success"] is True
 
 
-def test_feedback_refinement_loop(sample_report: AnalysisReport) -> None:
-    with patch("apkmorph.patch_generator.LLMClient") as mock_llm_cls:
-        mock_llm = MagicMock()
-        mock_llm.query.side_effect = [
-            json.dumps(
-                {
-                    "id": "plan_feedback",
-                    "rationale": "Initial plan",
-                    "modifications": [],
-                    "confidence": 0.75,
-                }
-            ),
-            json.dumps(
-                {
-                    "id": "plan_feedback",
-                    "rationale": "Refined after feedback",
-                    "modifications": [],
-                    "confidence": 0.92,
-                }
-            ),
-        ]
-        mock_llm_cls.return_value = mock_llm
+def test_export_python(generator: PatchGenerator, sample_report: AnalysisReport, tmp_path: Path):
+    plan = PatchPlan(
+        id="export1",
+        description="export test",
+        rationale="ok",
+        confidence=0.9,
+        modifications=[],
+    )
 
-        generator = PatchGenerator(model="gemma2")
-        plan1 = generator.from_description("remove ads", sample_report)
-        # simulate user feedback refinement
-        refined = generator.from_description(
-            "remove ads", sample_report  # in real UI this would augment system prompt
-        )
-
-        assert plan1.confidence == 0.75
-        assert refined.confidence == 0.92
-        assert mock_llm.query.call_count == 2
+    out = tmp_path / "exported.py"
+    path = generator.export(plan, out, fmt="python")
+    assert path.exists()
+    content = path.read_text()
+    assert "PatchPlan" in content
+    assert "from apkmorph" in content

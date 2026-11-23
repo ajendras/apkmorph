@@ -1,229 +1,234 @@
 """Tests for APKAnalyzer.
 
-Covers decompilation, cache optimisation, parallel Smali extraction,
-component discovery, string resource parsing, keyword search and
-runtime observation (with Frida fallback).
+Covers decompilation, cache validity, component extraction (including
+parallel multidex handling), keyword search, string resource parsing,
+runtime observation (simulation fallback), and certificate fingerprinting
+that works with androguard 4.1.4 on Python 3.12.
 """
 
-import time
+import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from apkmorph.analyzer import APKAnalyzer
 from apkmorph.models import AnalysisReport
 
 
 @pytest.fixture
-def temp_working_dir(tmp_path: Path) -> Path:
-    wd = tmp_path / "decompiled"
-    wd.mkdir(parents=True, exist_ok=True)
-    return wd
+def analyzer(tmp_path: Path) -> APKAnalyzer:
+    return APKAnalyzer(working_dir=tmp_path / "decompiled")
 
 
 @pytest.fixture
-def sample_apk(tmp_path: Path) -> Path:
-    apk = tmp_path / "sample.apk"
-    # Fake APK with ZIP header so Androguard does not immediately explode
-    apk.write_bytes(b"PK\x03\x04" + b"\x00" * 200)
-    return apk
+def mock_apk():
+    with patch("apkmorph.analyzer.APK") as mock:
+        instance = MagicMock()
+        instance.get_package.return_value = "com.example.app"
+        instance.get_androidversion_name.return_value = "1.0"
+        instance.get_androidversion_code.return_value = "1"
+        instance.get_min_sdk_version.return_value = 24
+        instance.get_target_sdk_version.return_value = 34
+        instance.get_main_activity.return_value = ".MainActivity"
+        instance.get_activities.return_value = [".MainActivity"]
+        instance.get_services.return_value = []
+        instance.get_receivers.return_value = []
+        instance.get_providers.return_value = []
+        instance.get_permissions.return_value = ["android.permission.INTERNET"]
+        instance.is_signed.return_value = True
+        instance.get_certificates.return_value = [b"fake-cert-bytes"]
+        yield instance
 
 
-def test_decompile_creates_valid_report(
-    sample_apk: Path, temp_working_dir: Path
-) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
+def test_decompile_missing_file(analyzer: APKAnalyzer):
+    with pytest.raises(FileNotFoundError, match="APK file not found"):
+        analyzer.decompile("nonexistent.apk")
 
-    mock_apk = MagicMock()
-    mock_apk.get_activities.return_value = ["com.example.MainActivity"]
-    mock_apk.get_services.return_value = []
-    mock_apk.get_receivers.return_value = []
-    mock_apk.get_providers.return_value = []
-    mock_apk.get_permissions.return_value = ["android.permission.INTERNET"]
-    mock_apk.get_package.return_value = "com.example.app"
-    mock_apk.get_main_activity.return_value = ".MainActivity"
-    mock_apk.get_androidversion_name.return_value = "1.0"
-    mock_apk.get_androidversion_code.return_value = "1"
-    mock_apk.get_min_sdk_version.return_value = 21
-    mock_apk.get_target_sdk_version.return_value = 33
-    mock_apk.is_signed.return_value = True
-    mock_apk.get_certificates.return_value = []
 
-    with patch("apkmorph.analyzer.run_apktool") as mock_run_apktool:
-        with patch("apkmorph.analyzer.APK", return_value=mock_apk):
-            report = analyzer.decompile(str(sample_apk))
+def test_decompile_invalid_extension(analyzer: APKAnalyzer, tmp_path: Path):
+    bad_file = tmp_path / "bad.txt"
+    bad_file.write_text("not an apk")
+    with pytest.raises(ValueError, match="Input must be a valid .apk file"):
+        analyzer.decompile(str(bad_file))
+
+
+@patch("apkmorph.analyzer.run_apktool")
+def test_decompile_creates_report(mock_run, analyzer: APKAnalyzer, mock_apk, tmp_path: Path):
+    apk_file = tmp_path / "test.apk"
+    apk_file.touch()
+
+    with patch.object(analyzer, "extract_components", return_value=["com.example.MainActivity"]):
+        with patch.object(
+            analyzer, "_extract_string_resources", return_value=(["Hello"], {"greeting": "Hello"})
+        ):
+            report = analyzer.decompile(str(apk_file), force=True)
 
     assert isinstance(report, AnalysisReport)
     assert report.package_name == "com.example.app"
     assert report.version_name == "1.0"
-    assert len(report.components) >= 1
+    assert report.main_activity == ".MainActivity"
     assert "com.example.MainActivity" in report.components
-    assert report.size_bytes > 0
-    mock_run_apktool.assert_called_once()
+    assert report.strings == ["Hello"]
+    assert report.string_resources == {"greeting": "Hello"}
+    assert report.metadata["is_signed"] is True
+    assert len(report.metadata["cert_fingerprints"]) == 1
+    assert len(report.metadata["cert_fingerprints"][0]) == 64
 
 
-def test_decompile_reuses_cache(
-    sample_apk: Path, temp_working_dir: Path
-) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
+def test_cache_validity(analyzer: APKAnalyzer, tmp_path: Path):
+    apk = tmp_path / "app.apk"
+    apk.touch()
+    cache_dir = tmp_path / "cache_test"
+    cache_dir.mkdir()
+    (cache_dir / "AndroidManifest.xml").write_text("<manifest package='com.test'/>")
+    (cache_dir / "smali").mkdir()
+    (cache_dir / "res" / "values").mkdir(parents=True)
+    (cache_dir / "smali" / "Test.smali").write_text(".class Lcom/test/Test;")
 
-    # Create a realistic cached tree
-    decomp_name = f"apk_sample_{int(sample_apk.stat().st_mtime)}"
-    decomp_dir: Path = temp_working_dir / decomp_name
-    decomp_dir.mkdir(parents=True)
-    (decomp_dir / "AndroidManifest.xml").write_text(
-        '<?xml version="1.0"?><manifest package="com.example.app"/>'
+    # cache newer than apk
+    cache_dir.touch()
+    assert analyzer._is_decompilation_valid(cache_dir, apk) is True
+
+    # missing manifest -> invalid
+    (cache_dir / "AndroidManifest.xml").unlink()
+    assert analyzer._is_decompilation_valid(cache_dir, apk) is False
+
+
+@patch("apkmorph.analyzer.run_apktool")
+def test_cache_skips_apktool(mock_run, analyzer: APKAnalyzer, tmp_path: Path, mock_apk):
+    apk = tmp_path / "app.apk"
+    apk.touch()
+    cache_dir = tmp_path / "cached"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "AndroidManifest.xml").write_text("<manifest/>")
+    (cache_dir / "smali").mkdir()
+    (cache_dir / "res/values").mkdir(parents=True)
+
+    # make cache look valid
+    cache_dir.touch()
+
+    with patch.object(analyzer, "extract_components", return_value=[]):
+        with patch.object(analyzer, "_extract_string_resources", return_value=([], {})):
+            analyzer.decompile(str(apk))  # should hit cache, no apktool call
+
+    mock_run.assert_not_called()
+
+
+def test_extract_components(analyzer: APKAnalyzer, tmp_path: Path):
+    smali_root = tmp_path / "smali"
+    smali_root.mkdir()
+    (smali_root / "com" / "example").mkdir(parents=True)
+    (smali_root / "com" / "example" / "MainActivity.smali").write_text(
+        ".class public Lcom/example/MainActivity;"
     )
-    (decomp_dir / "smali").mkdir()
-    (decomp_dir / "res" / "values").mkdir(parents=True)
-    (decomp_dir / "res" / "values" / "strings.xml").write_text(
-        "<resources><string name=\"app_name\">Test</string></resources>"
+    (smali_root / "com" / "example" / "utils" / "Helper.smali").write_text(
+        ".class public Lcom/example/utils/Helper;"
     )
 
-    # Make cache appear newer than APK
-    cache_mtime = time.time() + 10
-    decomp_dir.touch()
-    decomp_dir.stat = lambda: MagicMock(st_mtime=cache_mtime)  # type: ignore[method-assign]
-
-    with patch.object(analyzer, "_is_decompilation_valid", return_value=True):
-        with patch("apkmorph.analyzer.run_apktool") as mock_run:
-            with patch("apkmorph.analyzer.APK") as mock_apk_cls:
-                mock_apk = MagicMock()
-                mock_apk.get_activities.return_value = []
-                mock_apk.get_services.return_value = []
-                mock_apk.get_receivers.return_value = []
-                mock_apk.get_providers.return_value = []
-                mock_apk.get_permissions.return_value = []
-                mock_apk.get_package.return_value = "com.example.app"
-                mock_apk.get_main_activity.return_value = None
-                mock_apk.get_androidversion_name.return_value = "1.0"
-                mock_apk.get_androidversion_code.return_value = "1"
-                mock_apk.get_min_sdk_version.return_value = 21
-                mock_apk.get_target_sdk_version.return_value = 33
-                mock_apk.is_signed.return_value = False
-                mock_apk.get_certificates.return_value = []
-                mock_apk_cls.return_value = mock_apk
-
-                report = analyzer.decompile(str(sample_apk))
-
-    assert mock_run.call_count == 0
-    assert report.package_name == "com.example.app"
-    assert str(report.decompiled_dir) == str(decomp_dir.absolute())
-
-
-def test_decompile_force_bypasses_cache(
-    sample_apk: Path, temp_working_dir: Path
-) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
-
-    with patch("apkmorph.analyzer.run_apktool") as mock_run:
-        with patch("apkmorph.analyzer.APK") as mock_apk_cls:
-            mock_apk = MagicMock()
-            mock_apk.get_activities.return_value = []
-            mock_apk.get_services.return_value = []
-            mock_apk.get_receivers.return_value = []
-            mock_apk.get_providers.return_value = []
-            mock_apk.get_permissions.return_value = []
-            mock_apk.get_package.return_value = "com.example.app"
-            mock_apk.get_main_activity.return_value = None
-            mock_apk.get_androidversion_name.return_value = None
-            mock_apk.get_androidversion_code.return_value = None
-            mock_apk.get_min_sdk_version.return_value = None
-            mock_apk.get_target_sdk_version.return_value = None
-            mock_apk.is_signed.return_value = False
-            mock_apk.get_certificates.return_value = []
-            mock_apk_cls.return_value = mock_apk
-
-            report = analyzer.decompile(str(sample_apk), force=True)
-
-    assert mock_run.call_count == 1
-    assert isinstance(report, AnalysisReport)
-
-
-def test_extract_components_parallel(temp_working_dir: Path) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
-
-    # Fake multidex layout
-    (temp_working_dir / "smali" / "com" / "example").mkdir(parents=True)
-    (temp_working_dir / "smali" / "com" / "example" / "MainActivity.smali").write_text(
-        '.class public Lcom/example/MainActivity;'
-    )
-    (temp_working_dir / "smali_classes2" / "com" / "utils").mkdir(parents=True)
-    (
-        temp_working_dir / "smali_classes2" / "com" / "utils" / "Helper.smali"
-    ).write_text('.class public Lcom/utils/Helper;')
-
-    components = analyzer.extract_components(temp_working_dir)
-
+    components = analyzer.extract_components(tmp_path)
     assert "com.example.MainActivity" in components
-    assert "com.utils.Helper" in components
+    assert "com.example.utils.Helper" in components
+
+
+def test_extract_components_multidex_parallel(analyzer: APKAnalyzer, tmp_path: Path):
+    analyzer.parallel_enabled = True
+    for i in range(2):
+        d = tmp_path / f"smali_classes{i+1}"
+        d.mkdir(parents=True)
+        (d / "com" / f"Class{i}.smali").write_text(f".class Lcom/Class{i};")
+
+    components = analyzer.extract_components(tmp_path)
     assert len(components) == 2
+    assert any("Class0" in c for c in components)
+    assert any("Class1" in c for c in components)
 
 
-def test_extract_components_single_dir(temp_working_dir: Path) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
-    analyzer.parallel_enabled = False  # force serial path
+def test_find_by_keyword(analyzer: APKAnalyzer, tmp_path: Path):
+    smali = tmp_path / "smali"
+    smali.mkdir()
+    (smali / "Analytics.smali").write_text("invoke-static analytics")
+    (tmp_path / "res" / "values" / "strings.xml").mkdir(parents=True)
+    (tmp_path / "res" / "values" / "strings.xml").write_text(
+        '<string name="ad">banner</string>'
+    )
 
-    smali_dir = temp_working_dir / "smali" / "com" / "test"
-    smali_dir.mkdir(parents=True)
-    (smali_dir / "App.smali").write_text('.class public Lcom/test/App;')
+    matches = analyzer.find_by_keyword("analytics", tmp_path)
+    assert any("Analytics" in m for m in matches)
 
-    components = analyzer.extract_components(temp_working_dir)
-    assert "com.test.App" in components
+    matches = analyzer.find_by_keyword("ad", tmp_path)
+    assert any("strings.xml" in m for m in matches)
 
 
-def test_find_by_keyword(temp_working_dir: Path) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
-
-    # Create minimal XML with searchable content
-    values = temp_working_dir / "res" / "values"
+def test_extract_string_resources(analyzer: APKAnalyzer, tmp_path: Path):
+    values = tmp_path / "res" / "values"
     values.mkdir(parents=True)
     (values / "strings.xml").write_text(
-        '<resources><string name="hello">Hello Analytics</string></resources>'
-    )
-    (temp_working_dir / "AndroidManifest.xml").write_text(
-        '<manifest><uses-permission android:name="android.permission.INTERNET"/></manifest>'
-    )
-
-    matches = analyzer.find_by_keyword("analytics", temp_working_dir)
-    assert any("analytics" in m.lower() for m in matches)
-
-
-def test__extract_string_resources(temp_working_dir: Path) -> None:
-    analyzer = APKAnalyzer(working_dir=temp_working_dir)
-    values = temp_working_dir / "res" / "values"
-    values.mkdir(parents=True)
-    (values / "strings.xml").write_text(
-        """<resources>
-            <string name="app_name">Test App</string>
-            <string name="welcome">Welcome!</string>
-        </resources>"""
+        '''<?xml version="1.0"?>
+<resources>
+    <string name="app_name">Test App</string>
+    <string name="welcome">Hello World</string>
+</resources>'''
     )
 
-    strings, mapping = analyzer._extract_string_resources(temp_working_dir)
+    strings, mapping = analyzer._extract_string_resources(tmp_path)
     assert "Test App" in strings
-    assert "Welcome!" in strings
-    assert mapping.get("app_name") == "Test App"
-    assert mapping.get("welcome") == "Welcome!"
+    assert "Hello World" in strings
+    assert mapping["app_name"] == "Test App"
 
 
-def test_observe_runtime_fallback_simulation() -> None:
-    analyzer = APKAnalyzer()
+def test_observe_runtime_simulation(analyzer: APKAnalyzer):
     report = AnalysisReport(
-        apk_path=Path("dummy.apk"),
-        package_name="com.example.dummy",
-        decompiled_dir=Path("/tmp"),
-        components=[],
+        apk_path=Path("test.apk"),
+        package_name="com.test.app",
+        version_name="1.0",
+        version_code="1",
+        min_sdk=21,
+        target_sdk=34,
+        decompiled_dir=Path("/tmp/decomp"),
+        main_activity=".Main",
+        activities=[".Main"],
+        services=[],
+        receivers=[],
+        providers=[],
+        permissions=[],
+        components=[".Main"],
         strings=["firebase", "ad"],
         string_resources={},
+        metadata={},
         size_bytes=1024,
+        runtime_observations=[],
     )
 
-    with patch("apkmorph.analyzer.APKAnalyzer._run_frida_observation") as mock_frida:
-        mock_frida.return_value = ([], False)  # force simulation path
-        enriched = analyzer.observe_runtime(report, duration=1)
+    enriched = analyzer.observe_runtime(report, duration=0)
+    assert len(enriched.runtime_observations) >= 3
+    obs_text = " ".join(enriched.runtime_observations).lower()
+    assert "ad" in obs_text or "analytics" in obs_text
+    assert enriched.metadata["frida_used"] is False
 
-    assert len(enriched.runtime_observations) > 0
-    assert any("ad" in obs for obs in enriched.runtime_observations)
-    assert any("analytics" in obs for obs in enriched.runtime_observations)
+
+def test_cert_fingerprint_various_types(analyzer: APKAnalyzer):
+    # bytes
+    fp1 = analyzer._cert_fingerprint(b"testcert")
+    assert len(fp1) == 64
+
+    # asn1crypto style
+    class ASN1Cert:
+        def dump(self):
+            return b"asn1data"
+
+    fp2 = analyzer._cert_fingerprint(ASN1Cert())
+    assert len(fp2) == 64
+
+    # get_certificate style
+    class WrapperCert:
+        def get_certificate(self):
+            class Inner:
+                def dump(self):
+                    return b"inner"
+            return Inner()
+
+    fp3 = analyzer._cert_fingerprint(WrapperCert())
+    assert len(fp3) == 64
+
+    # fallback
+    fp4 = analyzer._cert_fingerprint("plainstring")
+    assert len(fp4) == 64

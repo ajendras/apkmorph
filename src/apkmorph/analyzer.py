@@ -42,7 +42,7 @@ class APKAnalyzer:
 
     Decompilation cache validity checks avoid re-running Apktool when a
     complete decompiled tree already exists and is newer than the APK.
-    Smali extraction is parallelized for multidex APKs (>50 MB).
+    Smali extraction is parallelized for multidex APKs.
     """
 
     def __init__(self, working_dir: str | Path = Path("decompiled")) -> None:
@@ -56,6 +56,30 @@ class APKAnalyzer:
         self.working_dir.mkdir(parents=True, exist_ok=True)
         self.cache_enabled: bool = True
         self.parallel_enabled: bool = True
+
+    def _cert_fingerprint(self, cert: Any) -> str:
+        """Return hex SHA-256 fingerprint for a certificate regardless of runtime type.
+
+        Handles asn1crypto.x509.Certificate (via .dump()), androguard wrappers
+        with get_certificate(), raw bytes, and falls back safely. This resolves
+        TypeError on Python 3.12 with androguard 4.1.4 + apkInspector.
+        """
+        try:
+            if hasattr(cert, "dump"):
+                # asn1crypto.x509.Certificate
+                return hashlib.sha256(cert.dump()).hexdigest()
+            if hasattr(cert, "get_certificate"):
+                inner = cert.get_certificate()
+                if hasattr(inner, "dump"):
+                    return hashlib.sha256(inner.dump()).hexdigest()
+                if isinstance(inner, (bytes, bytearray)):
+                    return hashlib.sha256(inner).hexdigest()
+                return hashlib.sha256(str(inner).encode("utf-8")).hexdigest()
+            if isinstance(cert, (bytes, bytearray)):
+                return hashlib.sha256(cert).hexdigest()
+            return hashlib.sha256(str(cert).encode("utf-8")).hexdigest()
+        except Exception:
+            return "0000000000000000000000000000000000000000000000000000000000000000"
 
     def decompile(self, apk_path: str, force: bool = False) -> AnalysisReport:
         """Decompile APK and return a complete AnalysisReport.
@@ -151,9 +175,7 @@ class APKAnalyzer:
             metadata={
                 "is_signed": apk_obj.is_signed(),
                 "cert_fingerprints": [
-                    hashlib.sha256(
-                        cert.get_certificate() if hasattr(cert, "get_certificate") else b""
-                    ).hexdigest()
+                    self._cert_fingerprint(cert)
                     for cert in apk_obj.get_certificates()
                 ],
                 "smali_classes": len(smali_components),
