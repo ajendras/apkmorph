@@ -32,6 +32,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 - Export any patch as a reusable Python script or JSON template for versioning, sharing, or CI
 - Direct ADB push, install (-r) and launch on a connected Android device or emulator with `--install --launch`
 - Automatic rollback on rebuild failure ensures failed patches never leave the decompiled tree in an inconsistent state
+- Optimized decompilation cache (reuses valid output when APK is unchanged) and parallel Smali parsing for large APKs (>50 MB)
 
 ## 🎬 Demo
 
@@ -316,7 +317,7 @@ flowchart TD
 pytest -q
 ```
 
-Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the Frida runtime observation path (with realistic simulation fallback when the optional frida package is not installed). The new `test_apply_plan_rollback_on_failure` exercises the automatic backup/rollback path when `rebuild_and_sign` raises an error. The `test_apply_plan_with_device_push` (and related mocks for `install_on_device`) exercises the ADB integration. New tests for the feedback refinement loop and UI confidence element have been added. Run with `pytest -q --cov` using the config in `pyproject.toml`.
+Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), cache hit/miss behaviour (including the new validity checks that skip Apktool for unchanged large APKs), parallel Smali extraction across multidex directories, `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the Frida runtime observation path (with realistic simulation fallback when the optional frida package is not installed). The new `test_apply_plan_rollback_on_failure` exercises the automatic backup/rollback path when `rebuild_and_sign` raises an error. The `test_apply_plan_with_device_push` (and related mocks for `install_on_device`) exercises the ADB integration. New tests for the feedback refinement loop and UI confidence element have been added. Run with `pytest -q --cov` using the config in `pyproject.toml`.
 
 ## 📍 Roadmap
 
@@ -332,7 +333,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Enable direct push to connected Android device with install + launch
 - [x] Improve error recovery with automatic rollback on rebuild failure
 - [x] Add confidence scoring UI element and user feedback loop to refine LLM prompts
-- [ ] Optimize decompilation cache and parallelize analysis for large APKs (>50 MB)
+- [x] Optimize decompilation cache and parallelize analysis for large APKs (>50 MB)
 - [ ] Publish curated patch template gallery that users can import with one click
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!

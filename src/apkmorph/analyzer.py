@@ -9,12 +9,17 @@ Frida-based runtime observation to capture live method behavior before
 patch generation. Frida is an optional dependency; when unavailable
 (realistic simulation based on strings is used). All operations are
 local and deterministic.
+
+Decompilation cache reuses valid output directories (skipping Apktool
+for unchanged APKs). Smali component extraction is parallelized across
+multidex (smali*) directories for large APKs (>50 MB).
 """
 
 import hashlib
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +39,10 @@ class APKAnalyzer:
     Runtime observation via optional Frida (or realistic simulation) feeds live
     method calls into the LLM for higher-quality patches. All operations are
     local and deterministic.
+
+    Decompilation cache validity checks avoid re-running Apktool when a
+    complete decompiled tree already exists and is newer than the APK.
+    Smali extraction is parallelized for multidex APKs (>50 MB).
     """
 
     def __init__(self, working_dir: str | Path = Path("decompiled")) -> None:
@@ -45,16 +54,24 @@ class APKAnalyzer:
         """
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_enabled: bool = True
+        self.parallel_enabled: bool = True
 
-    def decompile(self, apk_path: str) -> AnalysisReport:
+    def decompile(self, apk_path: str, force: bool = False) -> AnalysisReport:
         """Decompile APK and return a complete AnalysisReport.
 
         Uses Apktool for Smali/XML resources and Androguard for manifest metadata.
         Creates a unique output directory based on APK name and mtime.
         Extracts string_resources for AI-suggested XML edits.
 
+        If cache_enabled and a valid decompiled tree already exists (and is
+        not older than the APK), Apktool is skipped. Use force=True to
+        ignore cache. Smali component extraction is parallelized for large
+        multidex APKs.
+
         Args:
             apk_path: Filesystem path to the APK (must exist and end in .apk)
+            force: If True, ignore cache and always run decompilation
 
         Returns:
             AnalysisReport with all extracted metadata and decompiled_dir reference
@@ -74,20 +91,23 @@ class APKAnalyzer:
         decompiled_dir = self.working_dir / f"apk_{path.stem}_{int(path.stat().st_mtime)}"
         decompiled_dir.mkdir(parents=True, exist_ok=True)
 
-        # Decompile with Apktool (forces overwrite, skips Java source)
-        try:
-            run_apktool(
-                ["d", str(path), "-o", str(decompiled_dir), "-f", "--no-src"]
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr = getattr(exc, "stderr", b"")
-            if isinstance(stderr, (bytes, bytearray)):
-                stderr = stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Apktool decompilation failed: {stderr}") from exc
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                "Apktool not found. Please install Apktool and ensure it is on PATH."
-            ) from exc
+        if force or not (
+            self.cache_enabled and self._is_decompilation_valid(decompiled_dir, path)
+        ):
+            # Decompile with Apktool (forces overwrite, skips Java source)
+            try:
+                run_apktool(
+                    ["d", str(path), "-o", str(decompiled_dir), "-f", "--no-src"]
+                )
+            except subprocess.CalledProcessError as exc:
+                stderr = getattr(exc, "stderr", b"")
+                if isinstance(stderr, (bytes, bytearray)):
+                    stderr = stderr.decode("utf-8", errors="replace")
+                raise RuntimeError(f"Apktool decompilation failed: {stderr}") from exc
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    "Apktool not found. Please install Apktool and ensure it is on PATH."
+                ) from exc
 
         # Parse manifest and metadata with Androguard
         try:
@@ -144,10 +164,44 @@ class APKAnalyzer:
 
         return report
 
+    def _is_decompilation_valid(self, decompiled_dir: Path, apk_path: Path) -> bool:
+        """Return True if the decompiled directory can be reused without running Apktool.
+
+        Checks for presence of AndroidManifest.xml, at least one smali* directory,
+        a values resource directory, and that the cache is not older than the APK.
+        """
+        if not decompiled_dir.exists():
+            return False
+
+        manifest = decompiled_dir / "AndroidManifest.xml"
+        if not manifest.exists() or manifest.stat().st_size == 0:
+            return False
+
+        smali_dirs = list(decompiled_dir.glob("smali*"))
+        if not smali_dirs:
+            return False
+
+        values_dir = decompiled_dir / "res" / "values"
+        if not values_dir.exists():
+            return False
+
+        try:
+            apk_mtime = apk_path.stat().st_mtime
+            cache_mtime = decompiled_dir.stat().st_mtime
+            # Small tolerance for filesystem timestamp jitter
+            if cache_mtime >= apk_mtime - 2:
+                return True
+        except OSError:
+            return False
+
+        return False
+
     def extract_components(self, decompiled_dir: Path) -> List[str]:
         """Extract fully-qualified class names by walking all smali* directories.
 
-        Supports multidex (smali, smali_classes2, ...).
+        Supports multidex (smali, smali_classes2, ...). For APKs with multiple
+        smali directories (typical of large >50 MB APKs) extraction is
+        parallelized using ThreadPoolExecutor.
 
         Args:
             decompiled_dir: Root of the decompiled APK (must contain smali*/)
@@ -158,10 +212,29 @@ class APKAnalyzer:
         if not decompiled_dir or not decompiled_dir.exists():
             return []
 
+        smali_dirs = [p for p in decompiled_dir.glob("smali*") if p.is_dir()]
+        if not smali_dirs:
+            return []
+
         components: List[str] = []
-        for smali_variant in decompiled_dir.glob("smali*"):
-            if smali_variant.is_dir():
-                self._walk_smali(smali_variant, components)
+        if self.parallel_enabled and len(smali_dirs) > 1:
+            with ThreadPoolExecutor(max_workers=min(len(smali_dirs), 4)) as executor:
+                futures = [
+                    executor.submit(self._collect_components, sd) for sd in smali_dirs
+                ]
+                for future in as_completed(futures):
+                    components.extend(future.result())
+        else:
+            for sd in smali_dirs:
+                self._walk_smali(sd, components)
+
+        # Deduplicate while preserving first-seen order
+        return list(dict.fromkeys(components))
+
+    def _collect_components(self, root: Path) -> List[str]:
+        """Thread-safe helper that returns components for one smali root."""
+        components: List[str] = []
+        self._walk_smali(root, components)
         return components
 
     def _walk_smali(self, root: Path, components: List[str]) -> None:
