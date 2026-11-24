@@ -528,7 +528,8 @@ class APKAnalyzer:
             observations.append("observed: analytics - FirebaseAnalytics.logEvent() called with screen_view and user_engagement")
         if any(w in s for s in lower_strings for w in ("crash", "bug", "report", "exception")):
             observations.append("observed: crash_reporting - FirebaseCrashlytics.recordException() used")
+        total_hooks = len(observations)
         observations.append(
-            f"observed: {len(observations) + 2} total hooks triggered in {package_name} during observation window"
+            f"observed: {total_hooks} total hooks triggered in {package_name} during observation window"
         )
         return observations
