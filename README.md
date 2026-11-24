@@ -33,6 +33,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 - Direct ADB push, install (-r) and launch on a connected Android device or emulator with `--install --launch`
 - Automatic rollback on rebuild failure ensures failed patches never leave the decompiled tree in an inconsistent state
 - Optimized decompilation cache (reuses valid output when APK is unchanged) and parallel Smali parsing for large APKs (>50 MB)
+- Curated patch template gallery with one-click import for popular customizations (remove ads, disable tracking, force dark theme, etc.)
 
 ## 🎬 Demo
 
@@ -59,7 +60,7 @@ Power users and indie Android devs waste hours manually editing Smali to customi
 <tr>
 <td valign="top"><h3>📱 One-Click Deploy</h3><br>Direct ADB push, install and launch on a connected device/emulator after patching (requires Android SDK platform-tools on PATH)</td>
 <td valign="top"><h3>🛡️ Robust Recovery</h3><br>Automatic backup + rollback of the decompiled tree when a rebuild fails, keeping source pristine</td>
-<td></td>
+<td valign="top"><h3>🖼️ Curated Gallery</h3><br>Browse and import high-quality, pre-tested patch templates (ads removal, privacy, theming) with one click from CLI or UI</td>
 </tr>
 </table>
 
@@ -104,6 +105,10 @@ apkmorph batch "disable all analytics and remove ads" *.apk --output-dir ./patch
 
 # 5. Export the plan for reuse (Python script or JSON template)
 apkmorph export plan_abc123 --format python --output remove_ads_patch.py
+
+# 6. Browse and import from the curated gallery (new)
+apkmorph gallery
+apkmorph gallery --import remove_ads --apk sample.apk --apply
 ```
 
 The resulting `patched_*.apk` is ready to install. All commands are defined in `src/apkmorph/cli.py`.
@@ -119,6 +124,30 @@ apkmorph explain plan_abc123
 apkmorph batch "disable analytics and remove ads" app1.apk app2.apk --output-dir ./patched --no-observe
 apkmorph export plan_abc123 --format python
 ```
+
+**Curated Patch Template Gallery (new)**
+
+A growing collection of community-vetted, high-success templates. Import with one click — the template supplies an optimized prompt, the LLM tailors the plan to your specific APK, and you get rationale + confidence scores.
+
+```bash
+# List all curated templates
+apkmorph gallery
+
+# One-click import + apply
+apkmorph gallery --import remove_ads --apk mygame.apk --apply --install
+
+# Or combine with natural language for refinement
+apkmorph patch "remove ads" mygame.apk --apply
+```
+
+Templates currently include:
+- `remove_ads` — removes AdMob/Unity ads, replaces containers with a thank-you message
+- `disable_analytics` — no-ops Firebase, Adjust, AppsFlyer, crash reporting
+- `dark_theme` — forces night mode and updates styles.xml
+- `remove_splash` — eliminates launch screen for instant start
+- `change_name` — renames the app (icon swap supported via resources)
+
+The same gallery powers the Streamlit UI (sidebar cards with “Import” buttons).
 
 **Exporting patches for reuse**
 
@@ -145,7 +174,7 @@ The script decompiles the target, applies the saved modifications (Smali/XML/res
 apkmorph ui --port 8501
 ```
 
-The UI (located in `src/apkmorph/ui/app.py`) provides file upload, a chat-style prompt box, the interactive side-by-side Smali diff viewer (with hover explanations on changed lines), **color-coded confidence scoring**, a feedback form that augments the LLM prompt for iterative refinement, and one-click rebuild via `APKBuilder.rebuild_and_sign()`.
+The UI (located in `src/apkmorph/ui/app.py`) provides file upload, a chat-style prompt box, the interactive side-by-side Smali diff viewer (with hover explanations on changed lines), **color-coded confidence scoring**, a feedback form that augments the LLM prompt for iterative refinement, a **Curated Gallery** panel with one-click import buttons, and one-click rebuild via `APKBuilder.rebuild_and_sign()`.
 
 **Python library example** (see `examples/remove_ads.py`)
 
@@ -160,7 +189,9 @@ report = analyzer.decompile("game.apk")
 report = analyzer.observe_runtime(report)
 
 generator = PatchGenerator(model="gemma2")
-plan = generator.from_description("remove all ads and update app name", report)
+
+# One-click import from curated gallery (new)
+plan = generator.import_template("remove_ads", report)
 
 print(plan.rationale)
 print(f"Confidence: {plan.confidence:.2f}")
@@ -256,6 +287,8 @@ builder.align_and_sign("unsigned.apk", keystore="release.jks")
 | `analysis.max_strings`  | `250`                 | Limit passed to `AnalysisReport.strings` for LLM context |
 | `frida.duration`        | `10`                  | Observation window in seconds for Frida hooks |
 | `frida.auto_observe`    | `true`                | Whether `from_description` automatically enriches reports with runtime data |
+| `gallery.enabled`       | `true`                | Enable the curated template gallery in CLI and UI |
+| `gallery.show_confidence` | `true`              | Display template confidence scores in gallery listings |
 
 Copy `config.toml.example` to `config.toml` or `~/.config/apkmorph/config.toml`.
 
@@ -272,6 +305,7 @@ flowchart TD
     Generator --> LLM[LLMClient.query]
     LLM --> Ollama[(Ollama<br>llama3.2 / gemma2 / phi3 / codellama)]
     Generator --> Plugin[plugins.register_custom_patch_type]
+    Generator --> Gallery[gallery.get_template_by_id / import_template]
     Generator --> Plan[PatchPlan]
     Plan --> Validator[PatchGenerator.validate]
     Validator --> Editor[SmaliEditor.apply_modification<br>(smali/xml/resource + plugins)]
@@ -280,34 +314,37 @@ flowchart TD
     Builder --> Device[install_on_device() via ADB<br>(install + optional launch)]
     UI[Streamlit UI] -.-> Analyzer
     UI -.-> Generator
+    UI -.-> Gallery
     CLI[Typer CLI] -.-> Analyzer
     CLI -.-> Generator
+    CLI -.-> Gallery
 ```
 
-`APKAnalyzer` uses Apktool and Androguard to produce an immutable `AnalysisReport` (including `string_resources`). `PatchGenerator` sends enriched context to `LLMClient`, which returns a validated `PatchPlan` that may contain Smali, XML or resource modifications. `SmaliEditor` (extended for XML) applies minimal diffs to strings.xml and other resources; registered plugins are dispatched for custom `edit_type` values. `APKBuilder` assembles, aligns and signs the final APK (resources.arsc is regenerated by Apktool). All steps stay on the local machine. New `install_on_device()` uses `adb install -r` followed by `am start` when requested. `PatchGenerator.apply_plan` now automatically backs up the decompiled directory before edits and performs a full rollback on any rebuild/signing error. The UI now surfaces per-plan and per-modification confidence scores and feeds user comments back into the LLM system prompt for refinement.
+`APKAnalyzer` uses Apktool and Androguard to produce an immutable `AnalysisReport` (including `string_resources`). `PatchGenerator` sends enriched context to `LLMClient`, which returns a validated `PatchPlan` that may contain Smali, XML or resource modifications. `SmaliEditor` (extended for XML) applies minimal diffs to strings.xml and other resources; registered plugins are dispatched for custom `edit_type` values. `APKBuilder` assembles, aligns and signs the final APK (resources.arsc is regenerated by Apktool). All steps stay on the local machine. New `install_on_device()` uses `adb install -r` followed by `am start` when requested. `PatchGenerator.apply_plan` now automatically backs up the decompiled directory before edits and performs a full rollback on any rebuild/signing error. The UI now surfaces per-plan and per-modification confidence scores and feeds user comments back into the LLM system prompt for refinement. The new `gallery` module supplies curated, high-quality templates; `PatchGenerator.import_template()` provides the one-click import path used by both CLI and UI.
 
 ## 📁 Project structure
 
 ```text
 .
 ├── pyproject.toml                 # Metadata, dependencies, CLI entry point
-├── config.toml.example            # LLM, tools, signing and UI defaults
+├── config.toml.example            # LLM, tools, signing, UI and gallery defaults
 ├── src/apkmorph/
-│   ├── cli.py                     # Typer commands: analyze, patch, apply, explain, ui, batch
+│   ├── cli.py                     # Typer commands: analyze, patch, apply, explain, ui, batch, gallery
 │   ├── analyzer.py                # APKAnalyzer with decompile(), find_by_keyword() and string resource extraction
 │   ├── llm.py                     # LLMClient.query() and patch prompt templates (now XML/resource aware)
-│   ├── patch_generator.py         # PatchGenerator.from_description() + validate() + simulate_apply() + batch() + rollback support
+│   ├── patch_generator.py         # PatchGenerator.from_description() + validate() + simulate_apply() + batch() + rollback support + gallery integration
 │   ├── models.py                  # AnalysisReport, PatchPlan, Modification (Pydantic) with edit_type support
 │   ├── plugins.py                 # Simple plugin API: register_custom_patch_type() and handler registry
+│   ├── gallery.py                 # Curated templates + one-click import helpers (new)
 │   ├── smali.py                   # SmaliEditor (extended for XML, resource string edits and custom plugins)
 │   ├── builder.py                 # APKBuilder.rebuild(), align_and_sign(), rebuild_and_sign() + install_on_device()
-│   ├── ui/app.py                  # Streamlit dashboard with uploader and diff viewer
+│   ├── ui/app.py                  # Streamlit dashboard with uploader, diff viewer and gallery panel
 │   └── utils.py                   # run_apktool(), run_adb(), generate_report_md(), safe_copytree()
 ├── tests/
 │   ├── test_analyzer.py           # Tests decompilation, component extraction, keyword search and string_resources
-│   └── test_patch_generator.py    # Prompt construction, validation, simulate_apply() for Smali+XML+resource + batch tests + device push + rollback
+│   └── test_patch_generator.py    # Prompt construction, validation, simulate_apply() for Smali+XML+resource + batch tests + device push + rollback + new gallery tests
 ├── examples/
-│   └── remove_ads.py              # Runnable library example using natural-language API
+│   └── remove_ads.py              # Runnable library example using natural-language API and gallery import
 └── LICENSE
 ```
 
@@ -317,7 +354,7 @@ flowchart TD
 pytest -q
 ```
 
-Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), cache hit/miss behaviour (including the new validity checks that skip Apktool for unchanged large APKs), parallel Smali extraction across multidex directories, `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the Frida runtime observation path (with realistic simulation fallback when the optional frida package is not installed). The new `test_apply_plan_rollback_on_failure` exercises the automatic backup/rollback path when `rebuild_and_sign` raises an error. The `test_apply_plan_with_device_push` (and related mocks for `install_on_device`) exercises the ADB integration. New tests for the feedback refinement loop and UI confidence element have been added. Run with `pytest -q --cov` using the config in `pyproject.toml`.
+Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `string_resources`), cache hit/miss behaviour (including the new validity checks that skip Apktool for unchanged large APKs), parallel Smali extraction across multidex directories, `PatchGenerator` prompt construction for resource edits, `PatchPlan` validation, `simulate_apply()` dry-runs for XML/resource, the new `batch()` method (with full mocking), and the Frida runtime observation path (with realistic simulation fallback when the optional frida package is not installed). The new `test_apply_plan_rollback_on_failure` exercises the automatic backup/rollback path when `rebuild_and_sign` raises an error. The `test_apply_plan_with_device_push` (and related mocks for `install_on_device`) exercises the ADB integration. New tests for the feedback refinement loop, UI confidence element, and the curated gallery (`test_get_gallery`, `test_import_template`) have been added. Run with `pytest -q --cov` using the config in `pyproject.toml`.
 
 ## 📍 Roadmap
 
@@ -334,7 +371,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Improve error recovery with automatic rollback on rebuild failure
 - [x] Add confidence scoring UI element and user feedback loop to refine LLM prompts
 - [x] Optimize decompilation cache and parallelize analysis for large APKs (>50 MB)
-- [ ] Publish curated patch template gallery that users can import with one click
+- [x] Publish curated patch template gallery that users can import with one click
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
 <!-- roadmap:end -->

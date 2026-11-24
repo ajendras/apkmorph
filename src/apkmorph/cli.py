@@ -448,6 +448,94 @@ def export(
 
 
 @app.command()
+def gallery(
+    template_id: Optional[str] = typer.Option(
+        None,
+        "--import",
+        "-i",
+        help="Import a curated template by ID (one-click import)",
+    ),
+    apk_path: Optional[Path] = typer.Option(
+        None,
+        "--apk",
+        help="APK to generate a plan for when importing a template",
+    ),
+    apply_now: bool = typer.Option(
+        False,
+        "--apply",
+        help="Immediately apply the imported template (requires --import and --apk)",
+    ),
+    install: bool = typer.Option(
+        False, "--install", "-i", help="Install on device after applying"
+    ),
+    launch: bool = typer.Option(
+        True, "--launch/--no-launch", help="Launch after install"
+    ),
+) -> None:
+    """Browse or import from the curated patch template gallery.
+
+    The gallery contains high-quality, tested templates for common tasks
+    (remove ads, disable tracking, force dark theme, etc.). Importing a
+    template supplies an optimized prompt that is turned into a concrete
+    PatchPlan for the supplied APK.
+    """
+    generator = PatchGenerator()
+
+    if template_id:
+        if not apk_path:
+            console.print("[red]--apk is required when importing a template.[/red]")
+            raise typer.Exit(1)
+        console.print(
+            f"[bold]Importing curated template[/bold] [cyan]{template_id}[/cyan] for {apk_path.name} ..."
+        )
+        try:
+            analyzer = APKAnalyzer()
+            report = analyzer.decompile(str(apk_path.resolve()))
+            plan = generator.import_template(template_id, report)
+
+            rationale_panel = Panel(
+                plan.rationale,
+                title=f"GALLERY — {template_id}",
+                border_style="green",
+            )
+            console.print(rationale_panel)
+
+            _save_plan(plan)
+            console.print(f"[green]✓ Imported template → plan {plan.id}[/green]")
+
+            if apply_now:
+                _apply_plan(plan, apk_path, report=report, install=install, launch=launch)
+        except Exception as exc:
+            console.print(f"[red]Import failed: {exc}[/red]")
+            raise typer.Exit(1) from exc
+        return
+
+    # List mode
+    templates = generator.get_gallery()
+    console.print("[bold]Curated Patch Template Gallery[/bold] (import with one click)")
+    table = Table(title="Available Templates")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="green")
+    table.add_column("Category", style="blue")
+    table.add_column("Description")
+
+    for t in templates:
+        table.add_row(
+            t["id"],
+            t["name"],
+            t.get("category", "general"),
+            t["description"][:65] + ("…" if len(t["description"]) > 65 else ""),
+        )
+    console.print(table)
+
+    console.print(
+        "\n[bold]One-click import example:[/bold] "
+        "[yellow]apkmorph gallery --import remove_ads --apk myapp.apk --apply[/yellow]"
+    )
+    console.print("The same gallery is also available inside the Streamlit UI.")
+
+
+@app.command()
 def ui(
     port: int = typer.Option(8501, "--port", help="Port on which to run the Streamlit server"),
     debug: bool = typer.Option(False, "--debug", help="Run Streamlit in debug mode"),
