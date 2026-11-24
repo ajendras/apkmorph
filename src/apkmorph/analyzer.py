@@ -23,7 +23,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from androguard.core.bytecodes.apk import APK
+try:
+    # androguard >= 4.0 (the version pinned in pyproject.toml)
+    from androguard.core.apk import APK
+except ImportError:  # pragma: no cover - legacy androguard 3.x layout
+    from androguard.core.bytecodes.apk import APK
 
 from apkmorph.models import AnalysisReport
 from apkmorph.utils import run_apktool
