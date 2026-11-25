@@ -146,6 +146,7 @@ Templates currently include:
 - `dark_theme` — forces night mode and updates styles.xml
 - `remove_splash` — eliminates launch screen for instant start
 - `change_name` — renames the app (icon swap supported via resources)
+- `add_permissions` — adds common permissions via natural language (new)
 
 The same gallery powers the Streamlit UI (sidebar cards with “Import” buttons).
 
@@ -256,6 +257,10 @@ apkmorph batch "disable all analytics, remove ads and update app name" app1.apk 
 
 The command prints a rich summary table and places `patched_*.apk` files in the requested directory.
 
+**Natural-language manifest editing (new)**
+
+Requests like “add INTERNET and READ_EXTERNAL_STORAGE permissions, register a BootCompleted receiver, remove CAMERA permission” are now understood. The LLM produces `edit_type="manifest"` modifications that `SmaliEditor` applies directly to `AndroidManifest.xml` using precise XML updates. Current manifest components are included in the LLM context for accurate suggestions.
+
 <details><summary>Advanced: custom keystore and simulation</summary>
 
 ```bash
@@ -308,7 +313,7 @@ flowchart TD
     Generator --> Gallery[gallery.get_template_by_id / import_template]
     Generator --> Plan[PatchPlan]
     Plan --> Validator[PatchGenerator.validate]
-    Validator --> Editor[SmaliEditor.apply_modification<br>(smali/xml/resource + plugins)]
+    Validator --> Editor[SmaliEditor.apply_modification<br>(smali/xml/resource/manifest + plugins)]
     Editor --> Builder[APKBuilder.rebuild_and_sign]
     Builder --> Signed[patched_*.apk<br>(resources.arsc updated)]
     Builder --> Device[install_on_device() via ADB<br>(install + optional launch)]
@@ -372,6 +377,14 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Add confidence scoring UI element and user feedback loop to refine LLM prompts
 - [x] Optimize decompilation cache and parallelize analysis for large APKs (>50 MB)
 - [x] Publish curated patch template gallery that users can import with one click
+- [x] Add natural-language support for AndroidManifest.xml edits (permissions, activities, receivers) in PatchGenerator and SmaliEditor
+- [ ] Extend plugin API so custom patch types can supply their own LLM prompt fragments for better domain-specific suggestions
+- [ ] Add --verbose / --debug flag to all CLI commands with rich-formatted logging of each analysis and patching stage
+- [ ] Implement response caching for identical natural-language + model combinations inside LLMClient to speed up repeated queries
+- [ ] Expand test_patch_generator.py with new tests exercising manifest edits, plugin dispatch, and custom keystore flows
+- [ ] Add troubleshooting section to README.md covering common Android SDK tool errors, cache issues, and model download failures
+- [ ] Support environment-variable keystore passwords in APKBuilder.align_and_sign and document the pattern in config.toml.example
+- [ ] Create a new example/plugin for injecting custom network security config XML via the plugin registry
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
 <!-- roadmap:end -->

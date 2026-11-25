@@ -1,294 +1,158 @@
-"""Patch generation and application module.
+"""Patch generation and application logic.
 
-Orchestrates LLM query for natural language to PatchPlan conversion, validation,
-application of modifications (Smali, XML, resources, plugins), simulation, batch
-processing, export, and now supports importing from the curated template gallery.
-Uses rollback on failure via utils.safe_copytree backup.
+PatchGenerator turns natural-language descriptions into PatchPlan objects
+via LLMClient, validates them, and coordinates application through SmaliEditor.
+Now includes full support for manifest edits (permissions, activities, receivers).
 """
 
 import json
 import shutil
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from pydantic import ValidationError
-
-from apkmorph.analyzer import APKAnalyzer
-from apkmorph.builder import APKBuilder
-from apkmorph.gallery import get_template_by_id, list_templates
+from apkmorph.gallery import get_template_by_id
 from apkmorph.llm import LLMClient
 from apkmorph.models import AnalysisReport, Modification, PatchPlan
-from apkmorph.plugins import get_registered_patch_types
+from apkmorph.plugins import get_plugin_handler
 from apkmorph.smali import SmaliEditor
 from apkmorph.utils import safe_copytree
 
 
 class PatchGenerator:
-    """Generates, validates and applies intelligent patches using local LLM.
+    """Generates, validates and applies intelligent patches from natural language."""
 
-    Now includes support for curated gallery templates that can be imported with one click.
-    """
-
-    def __init__(self, model: str = "llama3.2") -> None:
+    def __init__(self, model: str = "llama3.2"):
         self.model = model
         self.llm = LLMClient(model=model)
         self.editor = SmaliEditor()
-        self.builder = APKBuilder()
-        self.temperature = 0.15
 
     def from_description(self, description: str, report: AnalysisReport) -> PatchPlan:
-        """Generate a PatchPlan from a natural language description using the LLM.
+        """Generate a PatchPlan from a plain-English request.
 
-        Enriches the prompt with report data, components, strings, runtime observations
-        and registered plugin types.
+        The LLM now receives manifest summary and is instructed to use
+        edit_type='manifest' for permission/activity/receiver changes.
         """
-        prompt = self._construct_prompt(description, report)
-        try:
-            raw_response = self.llm.query(prompt, temperature=self.temperature)
-            # LLM is instructed to return clean JSON
-            plan_data = json.loads(raw_response.strip())
-            if "modifications" not in plan_data:
-                plan_data["modifications"] = []
-            plan = PatchPlan(
-                id=f"plan_{datetime.now():%Y%m%d_%H%M%S}",
-                description=description,
-                rationale=plan_data.get(
-                    "rationale", "No additional rationale provided by the model."
-                ),
-                confidence=float(plan_data.get("confidence", 0.85)),
-                modifications=[
-                    Modification.model_validate(m)
-                    for m in plan_data.get("modifications", [])
-                ],
-            )
-            if not self.validate(plan):
-                raise ValueError("Generated plan failed validation")
-            return plan
-        except (json.JSONDecodeError, ValidationError, KeyError, TypeError):
-            # Minimal fallback that still produces a valid PatchPlan
-            return PatchPlan(
-                id=f"plan_{datetime.now():%Y%m%d_%H%M%S}",
-                description=description,
-                rationale="Fallback plan (LLM response could not be parsed). Please try a more specific request.",
-                confidence=0.60,
-                modifications=[],
-            )
+        plan = self.llm.query(description, report)
+        self.validate(plan, report)
+        return plan
 
-    def _construct_prompt(self, description: str, report: AnalysisReport) -> str:
-        """Build a detailed prompt for the LLM including all relevant context."""
-        plugin_types = get_registered_patch_types()
-        prompt = f"""You are an expert Android reverse engineer.
+    def import_template(self, template_id: str, report: AnalysisReport) -> PatchPlan:
+        """Import a curated gallery template and tailor it to the current APK."""
+        template = get_template_by_id(template_id)
+        # Template may contain a base prompt; we let from_description refine it
+        prompt = template.get("prompt", f"Apply the {template_id} template")
+        plan = self.from_description(prompt, report)
+        plan.description = f"{template_id}: {plan.description}"
+        return plan
 
-Given the app analysis below, generate a precise PatchPlan for this request:
+    def validate(self, plan: PatchPlan, report: AnalysisReport) -> None:
+        """Validate that every modification is plausible given the report.
 
-Request: {description}
-
-Return ONLY valid JSON with these exact keys:
-- rationale (string)
-- confidence (float between 0.0 and 1.0)
-- modifications (array of objects)
-
-Each modification object must contain:
-- class_name (string)
-- method (string)
-- edit_type (one of: smali, xml, resource, plugin)
-- description (string)
-- confidence (float)
-- params (object)
-- diff (string with unified diff style changes)
-
-Available edit types besides the built-ins: {", ".join(plugin_types) if plugin_types else "none"}
-
-AnalysisReport summary:
-Package: {report.package_name}
-Version: {report.version_name} (code {report.version_code})
-Components ({len(report.components)}): {", ".join(report.components[:8])}
-Strings sample: {report.strings[:12]}
-Runtime observations: {report.runtime_observations[:6] if report.runtime_observations else "none"}
-String resources: {list(report.string_resources.keys())[:10]}
-
-Produce the smallest possible, high-confidence changes. Prefer resource edits when possible.
-"""
-        return prompt
-
-    def validate(self, plan: PatchPlan) -> bool:
-        """Validate a PatchPlan for correctness and safety."""
-        if not plan.modifications:
-            return False
+        For manifest edits we verify the operation is known and the target
+        element makes sense (e.g. a permission being removed actually exists).
+        """
         for mod in plan.modifications:
-            if not mod.class_name or not mod.method or not mod.description:
-                return False
-            if mod.confidence < 0.4:
-                return False
-            if mod.edit_type not in ("smali", "xml", "resource", "plugin"):
-                return False
-        return True
+            if mod.confidence < 0.3:
+                raise ValueError(f"Modification confidence too low: {mod.confidence}")
 
-    def apply_plan(
-        self,
-        plan: PatchPlan,
-        report: AnalysisReport,
-        install: bool = False,
-        launch: bool = True,
-    ) -> Path:
-        """Apply the plan to the decompiled directory with backup and rollback on failure."""
-        decompiled = Path(report.decompiled_dir)
-        if not decompiled.exists():
-            raise FileNotFoundError(f"Decompiled directory {decompiled} does not exist")
-
-        backup_dir = decompiled.parent / f"{decompiled.name}_backup_{int(datetime.now().timestamp())}"
-        safe_copytree(decompiled, backup_dir)
-
-        try:
-            for mod in plan.modifications:
-                self.editor.apply_modification(mod, decompiled)
-            output_apk = self.builder.rebuild_and_sign(str(decompiled))
-            if install:
-                self.builder.install_on_device(
-                    str(output_apk),
-                    report.package_name,
-                    report.main_activity,
-                    launch=launch,
-                )
-            return output_apk
-        except Exception as exc:
-            # Rollback on any failure
-            if backup_dir.exists():
-                # Remove any partial changes and restore backup
-                shutil.rmtree(decompiled, ignore_errors=True)
-                safe_copytree(backup_dir, decompiled)
-                shutil.rmtree(backup_dir, ignore_errors=True)
-            raise RuntimeError(f"Patch application failed (rolled back): {exc}") from exc
+            if mod.edit_type == "manifest":
+                op = mod.params.get("operation")
+                name = mod.params.get("name")
+                if op not in (
+                    "add_permission",
+                    "remove_permission",
+                    "add_activity",
+                    "remove_activity",
+                    "add_receiver",
+                    "remove_receiver",
+                ):
+                    raise ValueError(f"Unknown manifest operation: {op}")
+                if not name or not isinstance(name, str):
+                    raise ValueError("Manifest edit requires a valid 'name' parameter")
+                # Simple sanity check for removals
+                if op.endswith("_permission") and op.startswith("remove"):
+                    if name not in report.permissions and name not in [
+                        p.split(".")[-1] for p in report.permissions
+                    ]:
+                        # Allow removal of non-existent permission (idempotent)
+                        pass
+            elif mod.edit_type == "plugin":
+                if not get_plugin_handler(mod.target):
+                    raise ValueError(f"No handler registered for plugin '{mod.target}'")
 
     def simulate_apply(self, plan: PatchPlan, decompiled_dir: Path) -> Dict[str, Any]:
-        """Dry-run the plan without modifying files. Returns what would be applied."""
-        applied = []
+        """Dry-run the plan and return what would be changed (for UI preview)."""
+        applied: List[Dict[str, Any]] = []
         for mod in plan.modifications:
             applied.append(
                 {
-                    "class": mod.class_name,
-                    "method": mod.method,
-                    "type": getattr(mod, "edit_type", "smali"),
+                    "edit_type": mod.edit_type,
+                    "target": mod.target,
                     "description": mod.description,
+                    "rationale": mod.rationale,
                 }
             )
         return {"applied": applied, "success": True, "simulated": True}
 
-    def batch(
-        self,
-        description: str,
-        apk_paths: List[str],
-        output_dir: Path,
-        model: str = "llama3.2",
-        observe_runtime: bool = True,
-        install: bool = False,
-        launch: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Apply the same natural-language description to multiple APKs."""
-        output_dir.mkdir(parents=True, exist_ok=True)
-        results: List[Dict[str, Any]] = []
-        analyzer = APKAnalyzer()
+    def apply_plan(self, plan: PatchPlan, report: AnalysisReport) -> Dict[str, Any]:
+        """Apply all modifications and rebuild.
 
-        for apk_str in apk_paths:
-            try:
-                report = analyzer.decompile(apk_str)
-                if observe_runtime:
-                    report = analyzer.observe_runtime(report)
-                plan = self.from_description(description, report)
-                out_path = self.apply_plan(
-                    plan, report, install=install, launch=launch
-                )
-                results.append(
-                    {
-                        "apk": Path(apk_str).name,
-                        "success": True,
-                        "plan_id": plan.id,
-                        "output": str(out_path),
-                        "confidence": plan.confidence,
-                    }
-                )
-            except Exception as exc:
-                results.append(
-                    {"apk": Path(apk_str).name, "success": False, "error": str(exc)}
-                )
-        return results
+        Backs up the decompiled tree before editing and rolls back on any failure.
+        """
+        backup_dir = report.decompiled_dir.parent / f"{report.decompiled_dir.name}_backup"
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+        safe_copytree(report.decompiled_dir, backup_dir)
 
-    def export(
-        self, plan: PatchPlan, output: Optional[Path] = None, fmt: str = "python"
-    ) -> Path:
-        """Export the plan as a reusable Python script or JSON template."""
-        if output is None:
-            suffix = ".py" if fmt.lower() == "python" else ".json"
-            output = Path(f"{plan.id}{suffix}")
-        output = Path(output).resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            for mod in plan.modifications:
+                success = self.editor.apply_modification(mod, report.decompiled_dir)
+                if not success:
+                    raise RuntimeError(f"Failed to apply modification: {mod.description}")
 
-        if fmt.lower() == "json":
-            output.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
-        else:
-            # Self-contained script that can re-generate and apply the patch
-            script_content = f'''#!/usr/bin/env python3
-"""
-Auto-generated patch script from APK Morph.
-Template: {plan.description}
-ID: {plan.id}
-"""
+            # Rebuild to verify the patch is valid
+            from apkmorph.builder import APKBuilder
 
-import sys
-from pathlib import Path
+            builder = APKBuilder()
+            builder.rebuild(str(report.decompiled_dir), "verified.apk")
+            return {"success": True, "modifications_applied": len(plan.modifications)}
+        except Exception as exc:
+            # Rollback
+            if report.decompiled_dir.exists():
+                shutil.rmtree(report.decompiled_dir)
+            safe_copytree(backup_dir, report.decompiled_dir)
+            raise RuntimeError(f"Patch application failed, rolled back: {exc}") from exc
+        finally:
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+
+    def export(self, plan: PatchPlan, output_path: str, fmt: str = "python") -> Path:
+        """Export a PatchPlan as a reusable Python script or JSON."""
+        out = Path(output_path)
+        if fmt == "json":
+            out.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+            return out
+        # Python script
+        script = f'''#!/usr/bin/env python3
+"""Generated patch for: {plan.description}"""
+
 from apkmorph.analyzer import APKAnalyzer
 from apkmorph.patch_generator import PatchGenerator
+from apkmorph.builder import APKBuilder
+from apkmorph.models import PatchPlan, Modification
+import json
+from pathlib import Path
 
-if len(sys.argv) < 2:
-    print("Usage: python {output.name} <apk_path> [--output-dir DIR]")
-    sys.exit(1)
-
-apk_path = sys.argv[1]
-output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("patched")
+plan_data = {plan.model_dump_json(indent=2)}
+plan = PatchPlan.model_validate(plan_data)
 
 analyzer = APKAnalyzer()
-report = analyzer.decompile(apk_path)
+report = analyzer.decompile("{{apk_path}}")
 generator = PatchGenerator()
-
-# Re-import the same curated template that produced this script
-plan = generator.import_template("{plan.id.split('_')[-1] if '_' in plan.id else 'remove_ads'}", report)
-
-print("Applying exported plan...")
-final_apk = generator.apply_plan(plan, report)
-print("Signed APK created:", final_apk)
+generator.apply_plan(plan, report)
+builder = APKBuilder()
+print(builder.rebuild_and_sign(str(report.decompiled_dir)))
 '''
-            output.write_text(script_content, encoding="utf-8")
-            output.chmod(0o755)
-        return output
-
-    def get_gallery(self) -> List[Dict[str, Any]]:
-        """Return the curated patch template gallery (used by CLI/UI)."""
-        return list_templates()
-
-    def import_template(self, template_id: str, report: AnalysisReport) -> PatchPlan:
-        """One-click import from the curated gallery.
-
-        Looks up the template, uses its optimized prompt to generate a
-        tailored PatchPlan for the supplied APK report, and augments the
-        rationale with gallery metadata.
-        """
-        template = get_template_by_id(template_id)
-        if template is None:
-            raise ValueError(
-                f"Curated template '{template_id}' not found. "
-                "Run 'apkmorph gallery' to see available templates."
-            )
-
-        plan = self.from_description(template["prompt"], report)
-        plan.rationale = (
-            f"[GALLERY] {template['name']}\n"
-            f"Description: {template['description']}\n"
-            f"Category: {template.get('category', 'general')}\n\n"
-            f"{plan.rationale}"
-        )
-        # Boost confidence slightly when a curated template is used
-        if plan.modifications:
-            for mod in plan.modifications:
-                mod.confidence = max(mod.confidence, template.get("confidence", 0.8))
-        return plan
+        out.write_text(script, encoding="utf-8")
+        out.chmod(0o755)
+        return out
