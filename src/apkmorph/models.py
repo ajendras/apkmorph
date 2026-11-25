@@ -1,48 +1,116 @@
-"""Data models for APK Morph.
+"""Pydantic models for APK Morph.
 
-Pydantic models for AnalysisReport, PatchPlan, Modification and related types.
-Supports edit_type values including the newly added manifest operations.
+Defines AnalysisReport (rich APK metadata + decompiled tree), PatchPlan
+and Modification (LLM-generated edit plans). All models are immutable by
+default and use Pydantic v2 idioms. The ConfigDict explicitly disables
+the protected "model_" namespace so that the "model_used" field no longer
+triggers a warning, and the old class-based Config is replaced to silence
+the DeprecationWarning that was breaking test collection on Python 3.11.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
+import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Modification(BaseModel):
-    """A single targeted change to an APK."""
+    """A single, auditable change that will be applied to Smali, XML,
+    a resource file, the manifest or a custom plugin.
+    """
 
-    edit_type: Literal[
-        "smali",
-        "xml",
-        "resource",
-        "manifest",
-        "plugin",
-    ]
-    target: str = Field(
-        ..., description="Class/method for smali, filename for xml/resource, or element for manifest"
+    edit_type: str = Field(
+        ...,
+        description="smali | xml | resource | manifest | plugin",
     )
-    description: str = Field(..., description="Plain-English description of the change")
-    before: str = ""
-    after: str = ""
-    params: Dict[str, Any] = Field(default_factory=dict)
-    rationale: str
-    confidence: float = Field(0.75, ge=0.0, le=1.0)
+    target: str = Field(
+        ...,
+        description="Fully-qualified class, method, resource key, XPath or plugin identifier",
+    )
+    change: str = Field(
+        ...,
+        description="Concrete edit (instruction, XML snippet, new value, etc.)",
+    )
+    rationale: str = Field(
+        default="",
+        description="Plain-English explanation the LLM provides to the user",
+    )
+    confidence: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="LLM confidence that the edit is correct",
+    )
+    before: Optional[str] = Field(
+        default=None,
+        description="Original code/text (for diff viewer)",
+    )
+    after: Optional[str] = Field(
+        default=None,
+        description="New code/text (for diff viewer)",
+    )
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra parameters used by custom plugin handlers",
+    )
+
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        extra="forbid",
+        populate_by_name=True,
+    )
 
 
 class PatchPlan(BaseModel):
-    """Complete plan returned by the LLM / PatchGenerator."""
+    """Complete patch plan produced by PatchGenerator.from_description().
 
-    description: str
-    modifications: List[Modification]
-    rationale: str
-    confidence: float = Field(0.8, ge=0.0, le=1.0)
-    model_used: str = "llama3.2"
+    Contains the original request, every Modification, an overall rationale,
+    confidence, the model that was used, and a unique ID for later export/apply.
+    """
+
+    plan_id: str = Field(
+        default_factory=lambda: f"plan_{uuid.uuid4().hex[:8]}",
+        description="Unique identifier used by CLI/UI for apply/explain/export",
+    )
+    description: str = Field(
+        ...,
+        description="Natural-language request that produced this plan",
+    )
+    modifications: List[Modification] = Field(default_factory=list)
+    rationale: str = Field(
+        default="",
+        description="Overall reasoning provided by the LLM",
+    )
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+    model_used: str = Field(
+        default="llama3.2",
+        description="Ollama model name that generated the plan",
+    )
+
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        extra="forbid",
+    )
+
+    def __str__(self) -> str:
+        return (
+            f"PatchPlan(plan_id={self.plan_id}, "
+            f"confidence={self.confidence:.2f}, "
+            f"mods={len(self.modifications)})"
+        )
 
 
 class AnalysisReport(BaseModel):
-    """Immutable report produced by APKAnalyzer."""
+    """Immutable snapshot of everything known about an APK.
+
+    Produced by APKAnalyzer.decompile() (and optionally enriched by
+    observe_runtime()). Used as context for the LLM and by the builder.
+    """
 
     apk_path: Path
     package_name: str
@@ -52,33 +120,23 @@ class AnalysisReport(BaseModel):
     target_sdk: Optional[int] = None
     decompiled_dir: Path
     main_activity: Optional[str] = None
+
     activities: List[str] = Field(default_factory=list)
     services: List[str] = Field(default_factory=list)
     receivers: List[str] = Field(default_factory=list)
     providers: List[str] = Field(default_factory=list)
     permissions: List[str] = Field(default_factory=list)
     components: List[str] = Field(default_factory=list)
+
     strings: List[str] = Field(default_factory=list)
     string_resources: Dict[str, str] = Field(default_factory=dict)
     runtime_observations: List[str] = Field(default_factory=list)
+
     metadata: Dict[str, Any] = Field(default_factory=dict)
     size_bytes: int = 0
 
-    class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {Path: str}
-
-
-class ManifestEditParams(BaseModel):
-    """Structured parameters for manifest edits."""
-
-    operation: Literal[
-        "add_permission",
-        "remove_permission",
-        "add_activity",
-        "remove_activity",
-        "add_receiver",
-        "remove_receiver",
-    ]
-    name: str
-    attributes: Dict[str, str] = Field(default_factory=dict)
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
