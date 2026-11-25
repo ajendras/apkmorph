@@ -212,14 +212,23 @@ print("Installed and launched on device")
 
 **Custom patch plugins**
 
-Register handlers for new `edit_type` values. The LLM prompt automatically discovers registered types and the `apply_modification` path dispatches to your handler.
+Register handlers for new `edit_type` values. The LLM prompt automatically discovers registered types **and their domain-specific prompt fragments** (new) and the `apply_modification` path dispatches to your handler.
 
 ```python
 from apkmorph.plugins import register_custom_patch_type
 from apkmorph.models import Modification
 from pathlib import Path
 
-@register_custom_patch_type("theme_injector")
+@register_custom_patch_type(
+    "theme_injector",
+    prompt_fragment=(
+        "Use edit_type='theme_injector' when the request involves colors, "
+        "dark/light mode, or full theme overlays. Supply params such as "
+        "primary_color, accent_color, night_mode_enabled. This produces "
+        "more coherent theming changes than generic XML edits because the "
+        "handler can update styles.xml, drawables and manifest flags together."
+    )
+)
 def inject_theme(mod: Modification, decompiled_dir: Path) -> bool:
     """Example: update primary color in styles.xml (or inject full theme overlay)."""
     color = mod.params.get("primary_color", "#3F51B5")
@@ -244,7 +253,7 @@ plan = generator.from_description(
 output = generator.apply_plan(plan, report)
 ```
 
-Register before calling `from_description` (or manually build a `PatchPlan` with the custom `edit_type`).
+The supplied `prompt_fragment` is automatically injected into the LLM system prompt, giving the model richer, domain-specific guidance so it chooses the correct `edit_type` and supplies the right parameters more reliably. Register before calling `from_description` (or manually build a `PatchPlan` with the custom `edit_type`).
 
 **Batch mode**
 
@@ -378,7 +387,7 @@ Tests cover `APKAnalyzer.decompile()` accuracy on fixture APKs (including `strin
 - [x] Optimize decompilation cache and parallelize analysis for large APKs (>50 MB)
 - [x] Publish curated patch template gallery that users can import with one click
 - [x] Add natural-language support for AndroidManifest.xml edits (permissions, activities, receivers) in PatchGenerator and SmaliEditor
-- [ ] Extend plugin API so custom patch types can supply their own LLM prompt fragments for better domain-specific suggestions
+- [x] Extend plugin API so custom patch types can supply their own LLM prompt fragments for better domain-specific suggestions
 - [ ] Add --verbose / --debug flag to all CLI commands with rich-formatted logging of each analysis and patching stage
 - [ ] Implement response caching for identical natural-language + model combinations inside LLMClient to speed up repeated queries
 - [ ] Expand test_patch_generator.py with new tests exercising manifest edits, plugin dispatch, and custom keystore flows

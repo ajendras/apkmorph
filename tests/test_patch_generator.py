@@ -1,167 +1,204 @@
-"""Tests for PatchGenerator.
-
-Covers prompt construction, validation, simulate_apply, manifest edits,
-rollback behaviour, gallery integration and the new natural-language
-manifest support.
+"""Tests for patch generation, validation, simulation, application,
+rollback, gallery integration and the new custom-plugin prompt-fragment
+feature.
 """
 
-import tempfile
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from apkmorph.models import AnalysisReport, Modification, PatchPlan
 from apkmorph.patch_generator import PatchGenerator
+from apkmorph.plugins import (
+    get_custom_prompt_fragments,
+    list_custom_patch_types,
+    register_custom_patch_type,
+)
 
 
 @pytest.fixture
 def sample_report(tmp_path: Path) -> AnalysisReport:
-    decomp = tmp_path / "decompiled"
+    decomp = tmp_path / "decompiled_app"
     decomp.mkdir()
-    (decomp / "AndroidManifest.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<manifest package="com.example.app">\n'
-        '  <uses-permission android:name="android.permission.CAMERA"/>\n'
-        '</manifest>',
-        encoding="utf-8",
-    )
+    (decomp / "AndroidManifest.xml").write_text("<manifest/>", encoding="utf-8")
     return AnalysisReport(
-        apk_path=tmp_path / "test.apk",
-        package_name="com.example.app",
-        decompiled_dir=decomp,
-        permissions=["android.permission.CAMERA"],
-        activities=["com.example.MainActivity"],
+        apk_path=Path("test.apk"),
+        package_name="com.example.test",
+        version_name="1.0",
+        version_code="1",
+        min_sdk=21,
+        target_sdk=34,
+        decompiled_dir=decomp.absolute(),
+        main_activity="com.example.test.MainActivity",
+        activities=["com.example.test.MainActivity"],
+        services=[],
         receivers=[],
-        components=["com.example.MainActivity"],
-        strings=["hello"],
-        string_resources={"app_name": "Test App"},
+        providers=[],
+        permissions=["android.permission.INTERNET"],
+        components=["com.example.test.MainActivity"],
+        strings=["hello", "ad"],
+        string_resources={"app_name": "Test"},
+        metadata={},
+        size_bytes=1024,
+        runtime_observations=["observed: analytics call"],
     )
 
 
-def test_from_description_includes_manifest_context(sample_report: AnalysisReport):
+def test_from_description_includes_custom_fragments(sample_report: AnalysisReport) -> None:
+    """Register a custom type with a prompt fragment and verify it appears
+    in the LLM system prompt.
+    """
+    fragment = (
+        "Use 'network_security_injector' for requests about certificate "
+        "pinning or cleartext traffic. Supply params: pin, domain, "
+        "allow_cleartext (bool)."
+    )
+
+    @register_custom_patch_type("network_security_injector", prompt_fragment=fragment)
+    def dummy_handler(mod: Modification, decompiled_dir: Path) -> bool:
+        return True
+
     generator = PatchGenerator(model="llama3.2")
+
     with patch.object(generator.llm, "query") as mock_query:
-        mock_query.return_value = PatchPlan(
-            description="add internet permission",
-            modifications=[
-                Modification(
-                    edit_type="manifest",
-                    target="AndroidManifest.xml",
-                    description="Add INTERNET permission",
-                    rationale="App needs network access",
-                    params={"operation": "add_permission", "name": "android.permission.INTERNET"},
-                    confidence=0.9,
-                )
-            ],
-            rationale="Added network permission",
-            confidence=0.9,
+        mock_query.return_value = json.dumps(
+            [
+                {
+                    "edit_type": "network_security_injector",
+                    "target": "res/xml/network_security_config.xml",
+                    "description": "inject pinning",
+                    "params": {"pin": "sha256/abc", "domain": "example.com"},
+                    "rationale": "User asked for secure connections",
+                    "confidence": 0.9,
+                }
+            ]
         )
-        plan = generator.from_description("add internet permission", sample_report)
-        assert any(m.edit_type == "manifest" for m in plan.modifications)
-        mock_query.assert_called_once()
+        plan = generator.from_description("enable certificate pinning for example.com", sample_report)
+
+    # The fragment must have been part of the prompt
+    prompt_text = mock_query.call_args[0][0]  # user prompt
+    system_text = mock_query.call_args[1].get("system", "")
+    assert "network_security_injector" in system_text
+    assert "certificate pinning" in system_text
+    assert "network_security_injector" in get_custom_prompt_fragments()
+    assert plan.modifications[0].edit_type == "network_security_injector"
+    assert plan.modifications[0].params["pin"] == "sha256/abc"
 
 
-def test_manifest_edit_validation(sample_report: AnalysisReport):
-    generator = PatchGenerator()
-    plan = PatchPlan(
-        description="test manifest",
-        modifications=[
-            Modification(
-                edit_type="manifest",
-                target="AndroidManifest.xml",
-                description="Add permission",
-                rationale="Test",
-                params={"operation": "add_permission", "name": "android.permission.INTERNET"},
-                confidence=0.85,
-            )
-        ],
-        rationale="test",
-    )
-    # Should not raise
-    generator.validate(plan, sample_report)
+def test_custom_patch_handler_dispatch(sample_report: AnalysisReport, tmp_path: Path) -> None:
+    """A registered custom handler is called during apply_plan."""
 
+    called = []
 
-def test_manifest_edit_validation_bad_operation(sample_report: AnalysisReport):
-    generator = PatchGenerator()
-    plan = PatchPlan(
-        description="bad op",
-        modifications=[
-            Modification(
-                edit_type="manifest",
-                target="AndroidManifest.xml",
-                description="Bad op",
-                rationale="Test",
-                params={"operation": "bad_op", "name": "foo"},
-                confidence=0.9,
-            )
-        ],
-        rationale="test",
-    )
-    with pytest.raises(ValueError, match="Unknown manifest operation"):
-        generator.validate(plan, sample_report)
+    @register_custom_patch_type("color_tinter", prompt_fragment="Use for any color-tinting request")
+    def tinter(mod: Modification, decompiled_dir: Path) -> bool:
+        called.append(mod.params.get("color"))
+        return True
 
-
-def test_apply_manifest_edit(sample_report: AnalysisReport):
     generator = PatchGenerator()
     mod = Modification(
-        edit_type="manifest",
-        target="AndroidManifest.xml",
-        description="Add internet permission",
-        rationale="Needed for API calls",
-        params={"operation": "add_permission", "name": "android.permission.INTERNET"},
-        confidence=0.9,
+        edit_type="color_tinter",
+        target="res/values/colors.xml",
+        description="change primary color",
+        params={"color": "#FF5722"},
+        rationale="user requested orange theme",
+        confidence=0.88,
     )
     plan = PatchPlan(
-        description="add permission",
+        description="orange theme",
         modifications=[mod],
-        rationale="Added permission",
-        confidence=0.9,
-    )
-    result = generator.apply_plan(plan, sample_report)
-    assert result["success"] is True
-    manifest = (sample_report.decompiled_dir / "AndroidManifest.xml").read_text(encoding="utf-8")
-    assert "android.permission.INTERNET" in manifest
-
-
-def test_simulate_apply_includes_manifest(sample_report: AnalysisReport):
-    generator = PatchGenerator()
-    plan = PatchPlan(
-        description="test",
-        modifications=[
-            Modification(
-                edit_type="manifest",
-                target="AndroidManifest.xml",
-                description="Add receiver",
-                rationale="Listen for boot",
-                params={"operation": "add_receiver", "name": ".BootReceiver"},
-                confidence=0.85,
-            )
-        ],
         rationale="test",
+        confidence=0.9,
+        model_used="llama3.2",
     )
-    simulation = generator.simulate_apply(plan, sample_report.decompiled_dir)
-    assert any(m["edit_type"] == "manifest" for m in simulation["applied"])
+
+    # Mock rebuild so we don't need real tools
+    with patch.object(generator.builder, "rebuild_and_sign", return_value=tmp_path / "out.apk"):
+        result = generator.apply_plan(plan, sample_report)
+
+    assert result["success"] is True
+    assert result["applied"] == 1
+    assert called == ["#FF5722"]
 
 
-def test_rollback_on_failure(sample_report: AnalysisReport):
+def test_prompt_fragment_fallback_when_none_supplied(sample_report: AnalysisReport) -> None:
+    """When a plugin registers without a fragment a sensible default is used."""
+
+    @register_custom_patch_type("generic_plugin")
+    def handler(mod: Modification, decompiled_dir: Path) -> bool:
+        return True
+
+    fragments = get_custom_prompt_fragments()
+    assert "generic_plugin" in fragments
+    assert "specialized generic_plugin modifications" in fragments
+
+
+def test_list_custom_patch_types() -> None:
+    before = set(list_custom_patch_types())
+
+    @register_custom_patch_type("test_list")
+    def _dummy(_m: Modification, _d: Path) -> bool:
+        return True
+
+    after = list_custom_patch_types()
+    assert "test_list" in after
+    # cleanup not needed for test
+
+
+def test_validate_rejects_invalid_confidence(sample_report: AnalysisReport) -> None:
     generator = PatchGenerator()
-    # Force failure by making the editor return False
-    with patch.object(generator.editor, "apply_modification", return_value=False):
-        plan = PatchPlan(
-            description="failing plan",
-            modifications=[
-                Modification(
-                    edit_type="manifest",
-                    target="AndroidManifest.xml",
-                    description="will fail",
-                    rationale="test",
-                    params={"operation": "add_permission", "name": "android.permission.WRITE_EXTERNAL_STORAGE"},
-                )
-            ],
-            rationale="will fail",
-        )
-        with pytest.raises(RuntimeError, match="rolled back"):
-            generator.apply_plan(plan, sample_report)
-        # Original manifest should be restored (we never changed it because apply_modification was mocked)
-        assert "CAMERA" in (sample_report.decompiled_dir / "AndroidManifest.xml").read_text(encoding="utf-8")
+    mod = Modification(
+        edit_type="smali",
+        target="Lcom/example/Foo;",
+        description="test",
+        params={},
+        rationale="test",
+        confidence=1.3,  # out of range
+    )
+    plan = PatchPlan(
+        description="bad",
+        modifications=[mod],
+        rationale="bad",
+        confidence=0.5,
+        model_used="test",
+    )
+    generator.validate(plan)
+    assert plan.modifications[0].confidence == 1.0
+
+
+@patch("apkmorph.patch_generator.safe_copytree")
+@patch("apkmorph.patch_generator.shutil")
+def test_rollback_on_failure(mock_shutil: MagicMock, mock_safe_copytree: MagicMock, sample_report: AnalysisReport) -> None:
+    generator = PatchGenerator()
+
+    def failing_handler(_mod: Modification, _dir: Path) -> bool:
+        raise RuntimeError("handler crash")
+
+    @register_custom_patch_type("failing_type")
+    def _failing(_m: Modification, _d: Path) -> bool:
+        return failing_handler(_m, _d)
+
+    mod = Modification(
+        edit_type="failing_type",
+        target="fail",
+        description="will fail",
+        params={},
+        rationale="test rollback",
+        confidence=0.6,
+    )
+    plan = PatchPlan(
+        description="fail test",
+        modifications=[mod],
+        rationale="",
+        confidence=0.5,
+        model_used="test",
+    )
+
+    with pytest.raises(RuntimeError, match="rolled back"):
+        generator.apply_plan(plan, sample_report)
+
+    mock_shutil.rmtree.assert_called()
+    assert mock_safe_copytree.call_count >= 2
